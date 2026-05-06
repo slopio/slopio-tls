@@ -1,0 +1,13 @@
+[package]
+name = "popple-tls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+libc = "0.2"
+rustls = "0.23.36"
+
+[dev-dependencies]
+runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+rcgen = "0.13"
