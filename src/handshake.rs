@@ -13,6 +13,7 @@ use crate::ktls::KtlsSocket;
 const RECORD_BUF: usize = 17 * 1024;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HandshakeError {
     Rustls(rustls::Error),
     Encode(EncodeError),
@@ -21,6 +22,34 @@ pub enum HandshakeError {
     UnexpectedState,
     LeftoverBytes,
     Timeout,
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandshakeError::Rustls(e) => write!(f, "TLS error: {e}"),
+            HandshakeError::Encode(e) => write!(f, "TLS encode error: {e:?}"),
+            HandshakeError::Io(e) => write!(f, "I/O error: {e}"),
+            HandshakeError::PeerClosed => f.write_str("peer closed connection during handshake"),
+            HandshakeError::UnexpectedState => {
+                f.write_str("unexpected TLS state during handshake")
+            }
+            HandshakeError::LeftoverBytes => {
+                f.write_str("leftover bytes after handshake could not be processed")
+            }
+            HandshakeError::Timeout => f.write_str("handshake timed out"),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HandshakeError::Rustls(e) => Some(e),
+            HandshakeError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl From<rustls::Error> for HandshakeError {
@@ -60,6 +89,7 @@ async fn handshake_inner(
     let mut in_buf: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(RECORD_BUF);
     let mut filled: usize = 0;
     let mut out_buf = vec![0u8; RECORD_BUF];
+    let mut pending_plaintext: Option<Vec<u8>> = None;
 
     enum Step {
         Continue,
@@ -110,17 +140,34 @@ async fn handshake_inner(
             }
             Step::Done => {
                 if filled > 0 {
-                    return Err(HandshakeError::LeftoverBytes);
+                    let view = unsafe { in_buf[..filled].assume_init_mut() };
+                    let UnbufferedStatus { state, .. } = conn.process_tls_records(view);
+                    match state? {
+                        ConnectionState::ReadTraffic(mut rt) => {
+                            let mut acc = Vec::new();
+                            while let Some(rec) = rt.next_record() {
+                                acc.extend_from_slice(rec?.payload);
+                            }
+                            if !acc.is_empty() {
+                                pending_plaintext = Some(acc);
+                            }
+                        }
+                        ConnectionState::WriteTraffic(_) => {}
+                        _ => return Err(HandshakeError::UnexpectedState),
+                    }
                 }
                 break;
             }
         }
     }
 
+    let alpn = conn.alpn_protocol().map(|s| s.to_vec());
     let (secrets, kernel_conn) = conn.dangerous_into_kernel_connection()?;
     let mut ktls = KtlsSocket::try_from(socket)?;
     ktls.install_keys(secrets)?;
     ktls.kernel_conn = Some(kernel_conn);
+    ktls.alpn = alpn;
+    ktls.pending_plaintext = pending_plaintext;
     Ok(ktls)
 }
 

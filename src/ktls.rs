@@ -6,13 +6,14 @@ use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
 pub struct KtlsSocket {
     socket: SocketWrapper,
     pub(crate) kernel_conn: Option<KernelConnection<ServerConnectionData>>,
+    pub(crate) alpn: Option<Vec<u8>>,
+    pub(crate) pending_plaintext: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
 pub enum ControlOutcome {
     Eof,
     KeyUpdate,
-    KeyUpdateAndRefresh,
     Alert { level: u8, description: u8 },
 }
 
@@ -23,6 +24,10 @@ impl KtlsSocket {
 
     pub fn as_socket(&self) -> &SocketWrapper {
         &self.socket
+    }
+
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.alpn.as_deref()
     }
 
     pub fn install_keys(&self, secrets: ExtractedSecrets) -> std::io::Result<()> {
@@ -78,10 +83,22 @@ impl KtlsSocket {
                     .map_err(|e| std::io::Error::other(format!("update_rx_secret: {e:?}")))?;
                 unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
                 if request_update {
-                    Ok(ControlOutcome::KeyUpdateAndRefresh)
-                } else {
-                    Ok(ControlOutcome::KeyUpdate)
+                    unsafe {
+                        send_control_record(
+                            self.socket.fd,
+                            TLS_RECORD_TYPE_HANDSHAKE,
+                            &KEY_UPDATE_NOT_REQUESTED,
+                        )?;
+                    }
+                    let kc = self.kernel_conn.as_mut().ok_or_else(|| {
+                        std::io::Error::other("KeyUpdate refresh requested but no KernelConnection")
+                    })?;
+                    let (tx_seq, tx_secret) = kc
+                        .update_tx_secret()
+                        .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
+                    unsafe { set_crypto_info(self.socket.fd, TLS_TX, tx_seq, &tx_secret)?; }
                 }
+                Ok(ControlOutcome::KeyUpdate)
             }
             TLS_RECORD_TYPE_ALERT => {
                 if n < 2 {
@@ -127,6 +144,8 @@ impl TryFrom<SocketWrapper> for KtlsSocket {
         Ok(KtlsSocket {
             socket,
             kernel_conn: None,
+            alpn: None,
+            pending_plaintext: None,
         })
     }
 }
@@ -140,6 +159,9 @@ const TLS_RECORD_TYPE_ALERT: u8 = 21;
 const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
 const TLS_1_3_VERSION: u16 = 0x0304;
+
+const CLOSE_NOTIFY_PAYLOAD: [u8; 2] = [1, 0];
+const KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0];
 
 const TLS_CIPHER_AES_GCM_128: u16 = 51;
 const TLS_CIPHER_AES_GCM_256: u16 = 52;
@@ -270,7 +292,14 @@ struct TlsCmsg {
 }
 
 unsafe fn send_close_notify(fd: i32) -> std::io::Result<()> {
-    let payload: [u8; 2] = [1, 0];
+    unsafe { send_control_record(fd, TLS_RECORD_TYPE_ALERT, &CLOSE_NOTIFY_PAYLOAD) }
+}
+
+unsafe fn send_control_record(
+    fd: i32,
+    record_type: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: payload.as_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
@@ -278,7 +307,7 @@ unsafe fn send_close_notify(fd: i32) -> std::io::Result<()> {
 
     let mut cmsg = TlsCmsg {
         hdr: unsafe { std::mem::zeroed() },
-        record_type: TLS_RECORD_TYPE_ALERT,
+        record_type,
     };
     cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
     cmsg.hdr.cmsg_level = SOL_TLS;
