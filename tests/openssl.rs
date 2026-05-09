@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use popple_tls::{HandshakeError, ServerSettings, handshake, server_config};
+use runtime::net::BufGroup;
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread;
 use runtime::net::{MultiAccept, socket_recv, socket_send};
@@ -282,5 +283,80 @@ fn alpn_mismatch_rejects_handshake() {
     assert!(
         !out.status.success(),
         "openssl exited successfully but should have failed on ALPN mismatch"
+    );
+}
+
+#[test]
+fn server_initiated_key_update_round_trip() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = make_config(None);
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("handshake");
+
+            let mut stream = ktls.into_messages(BufGroup::Small);
+
+            stream
+                .send(b"BEFORE_ROTATION\n")
+                .await
+                .expect("send before");
+            assert!(
+                stream.tx_records() > 0,
+                "tx_records should have incremented after first send"
+            );
+
+            stream.initiate_key_update().expect("initiate_key_update");
+            assert_eq!(
+                stream.tx_records(),
+                0,
+                "tx_records should reset to 0 after key update"
+            );
+
+            stream
+                .send(b"AFTER_ROTATION\n")
+                .await
+                .expect("send after");
+            assert!(
+                stream.tx_records() > 0,
+                "tx_records should increment again after post-rotation send"
+            );
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let out = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-tls1_3",
+            "-servername",
+            "localhost",
+            "-quiet",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("spawn openssl");
+
+    server.join().expect("server thread");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BEFORE_ROTATION"),
+        "missing pre-rotation message: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("AFTER_ROTATION"),
+        "missing post-rotation message (decrypt failure?): {stdout:?}"
     );
 }

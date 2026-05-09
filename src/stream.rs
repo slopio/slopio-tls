@@ -50,7 +50,15 @@ impl KtlsMessages {
         self.ktls.alpn()
     }
 
-    pub async fn send(&self, mut data: &[u8]) -> std::io::Result<()> {
+    pub fn tx_records(&self) -> u64 {
+        self.ktls.tx_records()
+    }
+
+    pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
+        self.ktls.initiate_key_update()
+    }
+
+    pub async fn send(&mut self, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
             let n = socket_send(self.ktls.as_socket(), data).await?;
             if n == 0 {
@@ -59,6 +67,7 @@ impl KtlsMessages {
                     "send returned 0",
                 ));
             }
+            self.ktls.tx_records += n.div_ceil(16384) as u64;
             data = &data[n..];
         }
         Ok(())

@@ -8,6 +8,7 @@ pub struct KtlsSocket {
     pub(crate) kernel_conn: Option<KernelConnection<ServerConnectionData>>,
     pub(crate) alpn: Option<Vec<u8>>,
     pub(crate) pending_plaintext: Option<Vec<u8>>,
+    pub(crate) tx_records: u64,
 }
 
 #[derive(Debug)]
@@ -28,6 +29,30 @@ impl KtlsSocket {
 
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    pub fn tx_records(&self) -> u64 {
+        self.tx_records
+    }
+
+    pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
+        unsafe {
+            send_control_record(
+                self.socket.fd,
+                TLS_RECORD_TYPE_HANDSHAKE,
+                &KEY_UPDATE_NOT_REQUESTED,
+            )?;
+        }
+        let kc = self
+            .kernel_conn
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("KeyUpdate requires KernelConnection"))?;
+        let (seq, secret) = kc
+            .update_tx_secret()
+            .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
+        unsafe { set_crypto_info(self.socket.fd, TLS_TX, seq, &secret)?; }
+        self.tx_records = 0;
+        Ok(())
     }
 
     pub fn install_keys(&self, secrets: ExtractedSecrets) -> std::io::Result<()> {
@@ -75,28 +100,17 @@ impl KtlsSocket {
                     return Err(std::io::Error::other("malformed post-handshake record"));
                 }
                 let request_update = payload[4] == 1;
-                let kc = self.kernel_conn.as_mut().ok_or_else(|| {
-                    std::io::Error::other("KeyUpdate received but no KernelConnection stored")
-                })?;
-                let (seq, secret) = kc
-                    .update_rx_secret()
-                    .map_err(|e| std::io::Error::other(format!("update_rx_secret: {e:?}")))?;
-                unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
-                if request_update {
-                    unsafe {
-                        send_control_record(
-                            self.socket.fd,
-                            TLS_RECORD_TYPE_HANDSHAKE,
-                            &KEY_UPDATE_NOT_REQUESTED,
-                        )?;
-                    }
+                {
                     let kc = self.kernel_conn.as_mut().ok_or_else(|| {
-                        std::io::Error::other("KeyUpdate refresh requested but no KernelConnection")
+                        std::io::Error::other("KeyUpdate received but no KernelConnection stored")
                     })?;
-                    let (tx_seq, tx_secret) = kc
-                        .update_tx_secret()
-                        .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
-                    unsafe { set_crypto_info(self.socket.fd, TLS_TX, tx_seq, &tx_secret)?; }
+                    let (seq, secret) = kc.update_rx_secret().map_err(|e| {
+                        std::io::Error::other(format!("update_rx_secret: {e:?}"))
+                    })?;
+                    unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
+                }
+                if request_update {
+                    self.initiate_key_update()?;
                 }
                 Ok(ControlOutcome::KeyUpdate)
             }
@@ -146,6 +160,7 @@ impl TryFrom<SocketWrapper> for KtlsSocket {
             kernel_conn: None,
             alpn: None,
             pending_plaintext: None,
+            tx_records: 0,
         })
     }
 }
