@@ -139,22 +139,43 @@ async fn handshake_inner(
                 filled += n;
             }
             Step::Done => {
-                if filled > 0 {
+                let mut acc = Vec::new();
+                while filled > 0 {
                     let view = unsafe { in_buf[..filled].assume_init_mut() };
-                    let UnbufferedStatus { state, .. } = conn.process_tls_records(view);
+                    let UnbufferedStatus { discard, state } = conn.process_tls_records(view);
+                    let made_progress = discard > 0;
                     match state? {
                         ConnectionState::ReadTraffic(mut rt) => {
-                            let mut acc = Vec::new();
                             while let Some(rec) = rt.next_record() {
                                 acc.extend_from_slice(rec?.payload);
                             }
-                            if !acc.is_empty() {
-                                pending_plaintext = Some(acc);
-                            }
                         }
                         ConnectionState::WriteTraffic(_) => {}
+                        ConnectionState::PeerClosed | ConnectionState::Closed => {
+                            return Err(HandshakeError::PeerClosed);
+                        }
                         _ => return Err(HandshakeError::UnexpectedState),
                     }
+                    if discard > 0 {
+                        let init = unsafe { in_buf[..filled].assume_init_mut() };
+                        init.copy_within(discard.., 0);
+                        filled -= discard;
+                    }
+                    if !made_progress {
+                        if filled == RECORD_BUF {
+                            return Err(HandshakeError::LeftoverBytes);
+                        }
+                        let n =
+                            socket_recv(&socket, &mut in_buf[filled..], RECORD_BUF - filled)
+                                .await?;
+                        if n == 0 {
+                            return Err(HandshakeError::PeerClosed);
+                        }
+                        filled += n;
+                    }
+                }
+                if !acc.is_empty() {
+                    pending_plaintext = Some(acc);
                 }
                 break;
             }

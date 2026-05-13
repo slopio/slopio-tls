@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use popple_tls::{ServerSettings, handshake, server_config};
+use popple_tls::{ServerSettings, handshake, ktls_available, server_config};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use runtime::main_thread;
@@ -9,6 +9,12 @@ use runtime::net::{BufGroup, MultiAccept};
 use runtime_streams::StreamExt;
 
 fn main() {
+    if !ktls_available() {
+        eprintln!("kTLS is not available on this system.");
+        eprintln!("Try: sudo modprobe tls");
+        std::process::exit(1);
+    }
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install default crypto provider");
