@@ -1,6 +1,7 @@
 pub mod config;
 pub mod handshake;
 pub mod ktls;
+mod pool;
 pub mod probe;
 pub mod stream;
 

@@ -5,7 +5,7 @@ use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
 
 pub struct KtlsSocket {
     socket: SocketWrapper,
-    pub(crate) kernel_conn: Option<KernelConnection<ServerConnectionData>>,
+    pub(crate) kernel_conn: KernelConnection<ServerConnectionData>,
     pub(crate) alpn: Option<Vec<u8>>,
     pub(crate) pending_plaintext: Option<Vec<u8>>,
     pub(crate) tx_records: u64,
@@ -43,11 +43,8 @@ impl KtlsSocket {
                 &KEY_UPDATE_NOT_REQUESTED,
             )?;
         }
-        let kc = self
+        let (seq, secret) = self
             .kernel_conn
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("KeyUpdate requires KernelConnection"))?;
-        let (seq, secret) = kc
             .update_tx_secret()
             .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
         unsafe { set_crypto_info(self.socket.fd, TLS_TX, seq, &secret)?; }
@@ -55,14 +52,39 @@ impl KtlsSocket {
         Ok(())
     }
 
-    pub fn install_keys(&self, secrets: ExtractedSecrets) -> std::io::Result<()> {
+    pub(crate) fn establish(
+        socket: SocketWrapper,
+        secrets: ExtractedSecrets,
+        kernel_conn: KernelConnection<ServerConnectionData>,
+        alpn: Option<Vec<u8>>,
+        pending_plaintext: Option<Vec<u8>>,
+    ) -> std::io::Result<Self> {
+        let ulp = b"tls";
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.fd,
+                libc::SOL_TCP,
+                libc::TCP_ULP,
+                ulp.as_ptr() as *const libc::c_void,
+                ulp.len() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         let (tx_seq, tx_secret) = secrets.tx;
         let (rx_seq, rx_secret) = secrets.rx;
         unsafe {
-            set_crypto_info(self.socket.fd, TLS_TX, tx_seq, &tx_secret)?;
-            set_crypto_info(self.socket.fd, TLS_RX, rx_seq, &rx_secret)?;
+            set_crypto_info(socket.fd, TLS_TX, tx_seq, &tx_secret)?;
+            set_crypto_info(socket.fd, TLS_RX, rx_seq, &rx_secret)?;
         }
-        Ok(())
+        Ok(KtlsSocket {
+            socket,
+            kernel_conn,
+            alpn,
+            pending_plaintext,
+            tx_records: 0,
+        })
     }
 
     pub fn handle_control_record(&mut self) -> std::io::Result<ControlOutcome> {
@@ -100,15 +122,11 @@ impl KtlsSocket {
                     return Err(std::io::Error::other("malformed post-handshake record"));
                 }
                 let request_update = payload[4] == 1;
-                {
-                    let kc = self.kernel_conn.as_mut().ok_or_else(|| {
-                        std::io::Error::other("KeyUpdate received but no KernelConnection stored")
-                    })?;
-                    let (seq, secret) = kc.update_rx_secret().map_err(|e| {
-                        std::io::Error::other(format!("update_rx_secret: {e:?}"))
-                    })?;
-                    unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
-                }
+                let (seq, secret) = self
+                    .kernel_conn
+                    .update_rx_secret()
+                    .map_err(|e| std::io::Error::other(format!("update_rx_secret: {e:?}")))?;
+                unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
                 if request_update {
                     self.initiate_key_update()?;
                 }
@@ -135,33 +153,6 @@ impl Drop for KtlsSocket {
         unsafe {
             let _ = send_close_notify(self.socket.fd);
         }
-    }
-}
-
-impl TryFrom<SocketWrapper> for KtlsSocket {
-    type Error = std::io::Error;
-
-    fn try_from(socket: SocketWrapper) -> Result<Self, Self::Error> {
-        let ulp = b"tls";
-        let ret = unsafe {
-            libc::setsockopt(
-                socket.fd,
-                libc::SOL_TCP,
-                libc::TCP_ULP,
-                ulp.as_ptr() as *const libc::c_void,
-                ulp.len() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(KtlsSocket {
-            socket,
-            kernel_conn: None,
-            alpn: None,
-            pending_plaintext: None,
-            tx_records: 0,
-        })
     }
 }
 

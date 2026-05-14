@@ -1,16 +1,14 @@
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::ServerConfig;
 use rustls::server::UnbufferedServerConnection;
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
-use runtime::net::{SocketWrapper, socket_recv, socket_send};
+use runtime::net::{SocketWrapper, socket_recv_init, socket_send};
 use runtime::runtime::time::timeout;
 
 use crate::ktls::KtlsSocket;
-
-const RECORD_BUF: usize = 17 * 1024;
+use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -86,9 +84,9 @@ async fn handshake_inner(
     config: Arc<ServerConfig>,
 ) -> Result<KtlsSocket, HandshakeError> {
     let mut conn = UnbufferedServerConnection::new(config)?;
-    let mut in_buf: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(RECORD_BUF);
+    let mut in_buf = PooledBuf::new();
+    let mut out_buf = PooledBuf::new();
     let mut filled: usize = 0;
-    let mut out_buf = vec![0u8; RECORD_BUF];
     let mut pending_plaintext: Option<Vec<u8>> = None;
 
     enum Step {
@@ -98,7 +96,7 @@ async fn handshake_inner(
     }
 
     loop {
-        let view: &mut [u8] = unsafe { in_buf[..filled].assume_init_mut() };
+        let view: &mut [u8] = &mut in_buf[..filled];
         let UnbufferedStatus { discard, state } = conn.process_tls_records(view);
 
         let step = match state? {
@@ -120,8 +118,7 @@ async fn handshake_inner(
         };
 
         if discard > 0 {
-            let init = unsafe { in_buf[..filled].assume_init_mut() };
-            init.copy_within(discard.., 0);
+            in_buf[..filled].copy_within(discard.., 0);
             filled -= discard;
         }
 
@@ -131,8 +128,8 @@ async fn handshake_inner(
                 if filled == RECORD_BUF {
                     return Err(HandshakeError::LeftoverBytes);
                 }
-                let n =
-                    socket_recv(&socket, &mut in_buf[filled..], RECORD_BUF - filled).await?;
+                let n = socket_recv_init(&socket, &mut in_buf[filled..], RECORD_BUF - filled)
+                    .await?;
                 if n == 0 {
                     return Err(HandshakeError::PeerClosed);
                 }
@@ -141,7 +138,7 @@ async fn handshake_inner(
             Step::Done => {
                 let mut acc = Vec::new();
                 while filled > 0 {
-                    let view = unsafe { in_buf[..filled].assume_init_mut() };
+                    let view = &mut in_buf[..filled];
                     let UnbufferedStatus { discard, state } = conn.process_tls_records(view);
                     let made_progress = discard > 0;
                     match state? {
@@ -157,17 +154,19 @@ async fn handshake_inner(
                         _ => return Err(HandshakeError::UnexpectedState),
                     }
                     if discard > 0 {
-                        let init = unsafe { in_buf[..filled].assume_init_mut() };
-                        init.copy_within(discard.., 0);
+                        in_buf[..filled].copy_within(discard.., 0);
                         filled -= discard;
                     }
                     if !made_progress {
                         if filled == RECORD_BUF {
                             return Err(HandshakeError::LeftoverBytes);
                         }
-                        let n =
-                            socket_recv(&socket, &mut in_buf[filled..], RECORD_BUF - filled)
-                                .await?;
+                        let n = socket_recv_init(
+                            &socket,
+                            &mut in_buf[filled..],
+                            RECORD_BUF - filled,
+                        )
+                        .await?;
                         if n == 0 {
                             return Err(HandshakeError::PeerClosed);
                         }
@@ -184,12 +183,8 @@ async fn handshake_inner(
 
     let alpn = conn.alpn_protocol().map(|s| s.to_vec());
     let (secrets, kernel_conn) = conn.dangerous_into_kernel_connection()?;
-    let mut ktls = KtlsSocket::try_from(socket)?;
-    ktls.install_keys(secrets)?;
-    ktls.kernel_conn = Some(kernel_conn);
-    ktls.alpn = alpn;
-    ktls.pending_plaintext = pending_plaintext;
-    Ok(ktls)
+    KtlsSocket::establish(socket, secrets, kernel_conn, alpn, pending_plaintext)
+        .map_err(HandshakeError::Io)
 }
 
 async fn send_all(socket: &SocketWrapper, mut data: &[u8]) -> Result<(), HandshakeError> {
