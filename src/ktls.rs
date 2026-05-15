@@ -120,10 +120,24 @@ impl KtlsSocket {
 
         match cmsg.record_type {
             TLS_RECORD_TYPE_HANDSHAKE => {
-                if n != 5 || payload[0] != HANDSHAKE_KEY_UPDATE {
-                    return Err(std::io::Error::other("malformed post-handshake record"));
+                // RFC 8446 §4.6.3: KeyUpdate = HandshakeType(1) || uint24 length(=1) || KeyUpdateRequest(1)
+                if n != 5
+                    || payload[0] != HANDSHAKE_KEY_UPDATE
+                    || payload[1..4] != [0, 0, 1]
+                {
+                    return Err(std::io::Error::other(
+                        "unexpected post-handshake handshake message",
+                    ));
                 }
-                let request_update = payload[4] == 1;
+                let request_update = match payload[4] {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "KeyUpdate: KeyUpdateRequest must be 0 or 1",
+                        ));
+                    }
+                };
                 let (seq, secret) = self
                     .kernel_conn
                     .update_rx_secret()

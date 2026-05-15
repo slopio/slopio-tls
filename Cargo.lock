@@ -271,6 +271,7 @@ dependencies = [
  "runtime",
  "runtime-streams",
  "rustls",
+ "zeroize",
 ]
 
 [[package]]

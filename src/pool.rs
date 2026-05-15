@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 
+use zeroize::Zeroize;
+
 pub(crate) const BUFFER_SIZE: usize = 17 * 1024;
 const POOL_MAX_LEN: usize = 32;
 
@@ -36,7 +38,8 @@ impl DerefMut for PooledBuf {
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        if let Some(buf) = self.inner.take() {
+        if let Some(mut buf) = self.inner.take() {
+            buf.zeroize();
             POOL.with(|p| {
                 let mut pool = p.borrow_mut();
                 if pool.len() < POOL_MAX_LEN {
