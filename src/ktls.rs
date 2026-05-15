@@ -221,6 +221,18 @@ struct Tls12CryptoInfoChacha20Poly1305 {
     rec_seq: [u8; 8],
 }
 
+fn arr_ref<'a, const N: usize>(
+    slice: &'a [u8],
+    what: &'static str,
+) -> std::io::Result<&'a [u8; N]> {
+    slice.try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what}: expected {N} bytes, got {}", slice.len()),
+        )
+    })
+}
+
 unsafe fn set_crypto_info(
     fd: i32,
     dir: libc::c_int,
@@ -230,15 +242,16 @@ unsafe fn set_crypto_info(
     let rec_seq = seq.to_be_bytes();
     let ret = match secret {
         ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
-            let iv_bytes = iv.as_ref();
+            let iv: &[u8; 12] = arr_ref(iv.as_ref(), "Aes128Gcm IV")?;
+            let key: &[u8; 16] = arr_ref(key.as_ref(), "Aes128Gcm key")?;
             let info = Tls12CryptoInfoAesGcm128 {
                 info: TlsCryptoInfo {
                     version: TLS_1_3_VERSION,
                     cipher_type: TLS_CIPHER_AES_GCM_128,
                 },
-                salt: iv_bytes[..4].try_into().unwrap(),
-                iv: iv_bytes[4..12].try_into().unwrap(),
-                key: key.as_ref().try_into().unwrap(),
+                salt: iv[..4].try_into().expect("12 >= 4"),
+                iv: iv[4..12].try_into().expect("12 >= 8"),
+                key: *key,
                 rec_seq,
             };
             unsafe {
@@ -252,15 +265,16 @@ unsafe fn set_crypto_info(
             }
         }
         ConnectionTrafficSecrets::Aes256Gcm { key, iv } => {
-            let iv_bytes = iv.as_ref();
+            let iv: &[u8; 12] = arr_ref(iv.as_ref(), "Aes256Gcm IV")?;
+            let key: &[u8; 32] = arr_ref(key.as_ref(), "Aes256Gcm key")?;
             let info = Tls12CryptoInfoAesGcm256 {
                 info: TlsCryptoInfo {
                     version: TLS_1_3_VERSION,
                     cipher_type: TLS_CIPHER_AES_GCM_256,
                 },
-                salt: iv_bytes[..4].try_into().unwrap(),
-                iv: iv_bytes[4..12].try_into().unwrap(),
-                key: key.as_ref().try_into().unwrap(),
+                salt: iv[..4].try_into().expect("12 >= 4"),
+                iv: iv[4..12].try_into().expect("12 >= 8"),
+                key: *key,
                 rec_seq,
             };
             unsafe {
@@ -274,13 +288,15 @@ unsafe fn set_crypto_info(
             }
         }
         ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+            let iv: &[u8; 12] = arr_ref(iv.as_ref(), "Chacha20Poly1305 IV")?;
+            let key: &[u8; 32] = arr_ref(key.as_ref(), "Chacha20Poly1305 key")?;
             let info = Tls12CryptoInfoChacha20Poly1305 {
                 info: TlsCryptoInfo {
                     version: TLS_1_3_VERSION,
                     cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
                 },
-                iv: iv.as_ref().try_into().unwrap(),
-                key: key.as_ref().try_into().unwrap(),
+                iv: *iv,
+                key: *key,
                 rec_seq,
             };
             unsafe {
