@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, server_config};
@@ -18,14 +17,12 @@ fn main() {
 
     let (cert, key) = self_signed_cert();
 
-    let config = Arc::new(
-        server_config(ServerSettings {
-            certs: vec![cert],
-            key,
-            alpn_protocols: Some(vec![b"http/1.1".to_vec()]),
-        })
-        .expect("server config"),
-    );
+    let config = server_config(ServerSettings {
+        certs: vec![cert],
+        key,
+        alpn_protocols: Some(&[b"http/1.1"]),
+    })
+    .expect("server config");
 
     println!("listening on 0.0.0.0:9092 (TLS 1.3 + ALPN http/1.1)");
     println!(
@@ -45,7 +42,7 @@ fn main() {
                         .unwrap_or_else(|| "<none>".to_string());
                     println!("handshake done, negotiated ALPN = {}", alpn);
 
-                    let mut stream = ktls.into_messages(BufGroup::Small);
+                    let mut stream = ktls.into_messages(BufGroup::Medium);
                     if let Err(e) = stream.send(RESPONSE).await {
                         eprintln!("send: {}", e);
                     }

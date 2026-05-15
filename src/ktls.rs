@@ -3,10 +3,12 @@ use rustls::kernel::KernelConnection;
 use rustls::server::ServerConnectionData;
 use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
 
+use crate::pool::PooledBuf;
+
 pub struct KtlsSocket {
     socket: SocketWrapper,
     pub(crate) kernel_conn: KernelConnection<ServerConnectionData>,
-    pub(crate) alpn: Option<Vec<u8>>,
+    pub(crate) alpn: Option<&'static [u8]>,
     pub(crate) pending_plaintext: Option<Vec<u8>>,
     pub(crate) tx_records: u64,
 }
@@ -27,8 +29,8 @@ impl KtlsSocket {
         &self.socket
     }
 
-    pub fn alpn(&self) -> Option<&[u8]> {
-        self.alpn.as_deref()
+    pub fn alpn(&self) -> Option<&'static [u8]> {
+        self.alpn
     }
 
     pub fn tx_records(&self) -> u64 {
@@ -56,7 +58,7 @@ impl KtlsSocket {
         socket: SocketWrapper,
         secrets: ExtractedSecrets,
         kernel_conn: KernelConnection<ServerConnectionData>,
-        alpn: Option<Vec<u8>>,
+        alpn: Option<&'static [u8]>,
         pending_plaintext: Option<Vec<u8>>,
     ) -> std::io::Result<Self> {
         let ulp = b"tls";
@@ -88,7 +90,7 @@ impl KtlsSocket {
     }
 
     pub fn handle_control_record(&mut self) -> std::io::Result<ControlOutcome> {
-        let mut payload = vec![0u8; 17 * 1024];
+        let mut payload = PooledBuf::new();
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr() as *mut libc::c_void,
             iov_len: payload.len(),

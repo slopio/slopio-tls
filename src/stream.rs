@@ -14,6 +14,7 @@ use crate::ktls::{ControlOutcome, KtlsSocket};
 /// decrypted by the kernel via kTLS and delivered through the multishot recv
 /// buffer ring. Both implement `AsRef<[u8]>`, so callers can treat them
 /// uniformly.
+#[non_exhaustive]
 pub enum Frame {
     Owned(Vec<u8>),
     Borrowed(BorrowedBuffer),
@@ -116,7 +117,7 @@ impl KtlsSocket {
 }
 
 impl KtlsMessages {
-    pub fn alpn(&self) -> Option<&[u8]> {
+    pub fn alpn(&self) -> Option<&'static [u8]> {
         self.ktls.alpn()
     }
 

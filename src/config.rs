@@ -7,7 +7,13 @@ use rustls::{CipherSuite, ServerConfig, SupportedCipherSuite};
 pub struct ServerSettings {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
-    pub alpn_protocols: Option<Vec<Vec<u8>>>,
+    pub alpn_protocols: Option<&'static [&'static [u8]]>,
+}
+
+#[derive(Clone)]
+pub struct Config {
+    pub rustls: Arc<ServerConfig>,
+    pub alpn_protocols: &'static [&'static [u8]],
 }
 
 const KTLS_SUPPORTED_SUITES: &[CipherSuite] = &[
@@ -16,7 +22,7 @@ const KTLS_SUPPORTED_SUITES: &[CipherSuite] = &[
     CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
 ];
 
-pub fn server_config(settings: ServerSettings) -> Result<ServerConfig, rustls::Error> {
+pub fn server_config(settings: ServerSettings) -> Result<Config, rustls::Error> {
     let default = CryptoProvider::get_default().ok_or_else(|| {
         rustls::Error::General(
             "no default CryptoProvider installed; \
@@ -48,13 +54,20 @@ pub fn server_config(settings: ServerSettings) -> Result<ServerConfig, rustls::E
         .with_no_client_auth()
         .with_single_cert(settings.certs, settings.key)?;
     cfg.enable_secret_extraction = true;
-    if let Some(alpn) = settings.alpn_protocols {
-        if alpn.is_empty() {
+    let alpn_protocols: &'static [&'static [u8]] = match settings.alpn_protocols {
+        Some(list) if list.is_empty() => {
             return Err(rustls::Error::General(
                 "alpn_protocols was Some but empty; use None to disable ALPN".into(),
             ));
         }
-        cfg.alpn_protocols = alpn;
-    }
-    Ok(cfg)
+        Some(list) => {
+            cfg.alpn_protocols = list.iter().map(|s| s.to_vec()).collect();
+            list
+        }
+        None => &[],
+    };
+    Ok(Config {
+        rustls: Arc::new(cfg),
+        alpn_protocols,
+    })
 }

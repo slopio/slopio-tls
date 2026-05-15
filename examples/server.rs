@@ -1,12 +1,11 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, ktls_available, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use runtime::main_thread;
 use runtime::net::{BufGroup, MultiAccept};
 use runtime_streams::StreamExt;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn main() {
     if !ktls_available() {
@@ -21,14 +20,12 @@ fn main() {
 
     let (cert, key) = self_signed_cert();
 
-    let config = Arc::new(
-        server_config(ServerSettings {
-            certs: vec![cert],
-            key,
-            alpn_protocols: None,
-        })
-        .expect("server config"),
-    );
+    let config = server_config(ServerSettings {
+        certs: vec![cert],
+        key,
+        alpn_protocols: None,
+    })
+    .expect("server config");
 
     println!("listening on 0.0.0.0:9091 (TLS 1.3, kTLS, KtlsMessages echo)");
     println!("test with: openssl s_client -connect 127.0.0.1:9091 -tls1_3 -servername localhost");
@@ -39,7 +36,7 @@ fn main() {
             let cfg = config.clone();
             match handshake(socket, cfg, Duration::from_secs(10)).await {
                 Ok(ktls) => {
-                    let mut stream = ktls.into_messages(BufGroup::Small);
+                    let mut stream = ktls.into_messages(BufGroup::Medium);
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(buf) => {
@@ -69,8 +66,7 @@ fn main() {
 }
 
 fn self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
     params.distinguished_name = rcgen::DistinguishedName::new();
     let key = KeyPair::generate().expect("keypair");
     let cert = params.self_signed(&key).expect("self sign");

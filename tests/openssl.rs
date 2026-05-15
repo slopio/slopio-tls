@@ -1,19 +1,17 @@
 use std::io::Write;
-use std::mem::MaybeUninit;
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use std::sync::mpsc;
-use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use popple_tls::{HandshakeError, ServerSettings, handshake, server_config};
-use runtime::net::BufGroup;
+use popple_tls::{Config, HandshakeError, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread;
-use runtime::net::{MultiAccept, socket_recv, socket_send};
+use runtime::net::BufGroup;
+use runtime::net::{MultiAccept, socket_send};
 use runtime_streams::StreamExt;
-use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -26,20 +24,18 @@ fn init_provider() {
     });
 }
 
-fn make_config(alpn_protocols: Option<Vec<Vec<u8>>>) -> Arc<ServerConfig> {
+fn make_config(alpn_protocols: Option<&'static [&'static [u8]]>) -> Config {
     let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let key = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    Arc::new(
-        server_config(ServerSettings {
-            certs: vec![cert_der],
-            key: key_der,
-            alpn_protocols,
-        })
-        .expect("server config"),
-    )
+    server_config(ServerSettings {
+        certs: vec![cert_der],
+        key: key_der,
+        alpn_protocols,
+    })
+    .expect("server config")
 }
 
 fn pick_port() -> u16 {
@@ -111,13 +107,14 @@ fn echo_round_trip() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
-            let mut buf: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(4096);
-            let n = socket_recv(ktls.as_socket(), &mut buf, 4096)
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let frame = stream
+                .next()
                 .await
+                .expect("stream ended")
                 .expect("recv");
-            let data = unsafe { buf[..n].assume_init_ref() };
-            socket_send(ktls.as_socket(), data).await.expect("send");
-            // dropping ktls here sends close_notify and closes the socket;
+            stream.send(frame.as_ref()).await.expect("send");
+            // dropping stream here sends close_notify and closes the socket;
             // openssl client sees the close and exits.
         });
     });
@@ -201,7 +198,7 @@ fn alpn_match_succeeds_and_exposes_negotiated_protocol() {
 
     let server = thread::spawn(move || {
         main_thread(async move {
-            let cfg = make_config(Some(vec![b"http/1.1".to_vec()]));
+            let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
             let socket = acc.next().await.expect("accept");
@@ -209,7 +206,9 @@ fn alpn_match_succeeds_and_exposes_negotiated_protocol() {
                 .await
                 .expect("handshake");
             assert_eq!(ktls.alpn(), Some(b"http/1.1" as &[u8]));
-            socket_send(ktls.as_socket(), b"ALPN_OK\n").await.expect("send");
+            socket_send(ktls.as_socket(), b"ALPN_OK\n")
+                .await
+                .expect("send");
         });
     });
 
@@ -246,7 +245,7 @@ fn alpn_mismatch_rejects_handshake() {
 
     let server = thread::spawn(move || {
         main_thread(async move {
-            let cfg = make_config(Some(vec![b"http/1.1".to_vec()]));
+            let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
             let socket = acc.next().await.expect("accept");
@@ -287,6 +286,140 @@ fn alpn_mismatch_rejects_handshake() {
 }
 
 #[test]
+fn stream_echo_round_trip() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = make_config(None);
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("handshake");
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(frame) => {
+                        let data: &[u8] = frame.as_ref();
+                        if stream.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-tls1_3",
+            "-servername",
+            "localhost",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openssl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        write!(stdin, "STREAM_PING\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "Q\n").unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+
+    server.join().expect("server thread");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("STREAM_PING"),
+        "missing echo via KtlsMessages: {stdout:?}"
+    );
+}
+
+#[test]
+fn peer_initiated_key_update_round_trip() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = make_config(None);
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("handshake");
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(frame) => {
+                        let data: &[u8] = frame.as_ref();
+                        if stream.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-tls1_3",
+            "-servername",
+            "localhost",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openssl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        write!(stdin, "BEFORE_PEER_KU\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "k\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "AFTER_PEER_KU\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "Q\n").unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+
+    server.join().expect("server thread");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BEFORE_PEER_KU"),
+        "missing pre-KU echo: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("AFTER_PEER_KU"),
+        "missing post-KU echo (KeyUpdate handling failed?): {stdout:?}"
+    );
+}
+
+#[test]
 fn server_initiated_key_update_round_trip() {
     init_provider();
     let port = pick_port();
@@ -302,7 +435,7 @@ fn server_initiated_key_update_round_trip() {
                 .await
                 .expect("handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Small);
+            let mut stream = ktls.into_messages(BufGroup::Medium);
 
             stream
                 .send(b"BEFORE_ROTATION\n")
@@ -320,10 +453,7 @@ fn server_initiated_key_update_round_trip() {
                 "tx_records should reset to 0 after key update"
             );
 
-            stream
-                .send(b"AFTER_ROTATION\n")
-                .await
-                .expect("send after");
+            stream.send(b"AFTER_ROTATION\n").await.expect("send after");
             assert!(
                 stream.tx_records() > 0,
                 "tx_records should increment again after post-rotation send"
