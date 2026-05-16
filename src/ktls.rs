@@ -64,7 +64,9 @@ impl KtlsSocket {
             .kernel_conn
             .update_tx_secret()
             .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
-        unsafe { set_crypto_info(self.socket.fd, TLS_TX, seq, &secret)?; }
+        unsafe {
+            set_crypto_info(self.socket.fd, TLS_TX, seq, &secret)?;
+        }
         self.tx_records = 0;
         Ok(())
     }
@@ -157,9 +159,7 @@ impl KtlsSocket {
                 if payload[0] != HANDSHAKE_KEY_UPDATE {
                     return Ok(ControlAction::SendFatal {
                         payload: &FATAL_UNEXPECTED_MESSAGE,
-                        err: std::io::Error::other(
-                            "unexpected post-handshake handshake message",
-                        ),
+                        err: std::io::Error::other("unexpected post-handshake handshake message"),
                     });
                 }
                 let request_update = match payload[4] {
@@ -178,7 +178,9 @@ impl KtlsSocket {
                     .kernel_conn
                     .update_rx_secret()
                     .map_err(|e| std::io::Error::other(format!("update_rx_secret: {e:?}")))?;
-                unsafe { set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?; }
+                unsafe {
+                    set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?;
+                }
                 if request_update {
                     self.initiate_key_update()?;
                 }
@@ -381,11 +383,7 @@ struct TlsCmsg {
 /// sendmsg syscall (returns immediately on a non-blocking socket for a
 /// 5-byte payload) is acceptable. Fatal-alert sends go through the async
 /// `runtime::net::socket_send_control_record` path instead.
-unsafe fn send_control_record(
-    fd: i32,
-    record_type: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
+unsafe fn send_control_record(fd: i32, record_type: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: payload.as_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
