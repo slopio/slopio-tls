@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use runtime::net::{SocketWrapper, socket_recv_init, socket_send};
 use runtime::runtime::time::timeout;
-use rustls::server::UnbufferedServerConnection;
+use rustls::ExtractedSecrets;
+use rustls::kernel::KernelConnection;
+use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use crate::config::Config;
@@ -67,26 +69,54 @@ impl From<std::io::Error> for HandshakeError {
     }
 }
 
+/// Abstracts the two `UnbufferedXxxConnection` types so the handshake loop is
+/// written once. rustls's `process_tls_records` is split into side-specific
+/// inherent impls — only the early-data handling differs — so a trait is the
+/// cheapest way to dedupe without forking the loop body.
+pub(crate) trait UnbufferedDriver: Sized {
+    type Data;
+    fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
+    fn negotiated_alpn(&self) -> Option<&[u8]>;
+    fn into_kernel(self)
+    -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error>;
+}
+
+impl UnbufferedDriver for UnbufferedServerConnection {
+    type Data = ServerConnectionData;
+    fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data> {
+        self.process_tls_records(in_buf)
+    }
+    fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.alpn_protocol()
+    }
+    fn into_kernel(
+        self,
+    ) -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error> {
+        self.dangerous_into_kernel_connection()
+    }
+}
+
 pub async fn handshake(
     socket: SocketWrapper,
     config: Config,
     deadline: Duration,
 ) -> Result<KtlsSocket, HandshakeError> {
-    match timeout(deadline, handshake_inner(socket, config)).await {
+    let Config {
+        rustls,
+        alpn_protocols,
+    } = config;
+    let conn = UnbufferedServerConnection::new(rustls)?;
+    match timeout(deadline, drive_handshake(socket, conn, alpn_protocols)).await {
         Ok(result) => result,
         Err(()) => Err(HandshakeError::Timeout),
     }
 }
 
-async fn handshake_inner(
+pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     socket: SocketWrapper,
-    config: Config,
-) -> Result<KtlsSocket, HandshakeError> {
-    let Config {
-        rustls,
-        alpn_protocols,
-    } = config;
-    let mut conn = UnbufferedServerConnection::new(rustls)?;
+    mut conn: C,
+    alpn_protocols: &'static [&'static [u8]],
+) -> Result<KtlsSocket<C::Data>, HandshakeError> {
     let mut in_buf = PooledBuf::new();
     let mut out_buf = PooledBuf::new();
     let mut filled: usize = 0;
@@ -94,8 +124,7 @@ async fn handshake_inner(
     let mut handshake_done = false;
 
     loop {
-        let UnbufferedStatus { discard, state } =
-            conn.process_tls_records(&mut in_buf[..filled]);
+        let UnbufferedStatus { discard, state } = conn.step(&mut in_buf[..filled]);
 
         let s = match state {
             Ok(s) => s,
@@ -130,7 +159,9 @@ async fn handshake_inner(
             }
             ConnectionState::TransmitTlsData(t) => t.done(),
             ConnectionState::BlockedHandshake if handshake_done => {
-                return Err(HandshakeError::UnexpectedState("BlockedHandshake after handshake"));
+                return Err(HandshakeError::UnexpectedState(
+                    "BlockedHandshake after handshake",
+                ));
             }
             ConnectionState::BlockedHandshake => {
                 shift(&mut in_buf, &mut filled, discard);
@@ -167,9 +198,9 @@ async fn handshake_inner(
     }
 
     let alpn = conn
-        .alpn_protocol()
+        .negotiated_alpn()
         .and_then(|neg| alpn_protocols.iter().copied().find(|p| *p == neg));
-    let (secrets, kernel_conn) = conn.dangerous_into_kernel_connection()?;
+    let (secrets, kernel_conn) = conn.into_kernel()?;
     KtlsSocket::establish(socket, secrets, kernel_conn, alpn, pending_plaintext)
         .map_err(HandshakeError::Io)
 }
@@ -209,14 +240,14 @@ async fn recv_more(
 /// queued alert surfaces as `EncodeTlsData` on the next call. A fatal alert
 /// is a single record, so one pass is enough; calling again after sending
 /// would land in the deframer with a stale buffer and panic.
-async fn drain_pending_alert(
-    conn: &mut UnbufferedServerConnection,
+async fn drain_pending_alert<C: UnbufferedDriver>(
+    conn: &mut C,
     socket: &SocketWrapper,
     in_buf: &mut PooledBuf,
     filled: usize,
     out_buf: &mut PooledBuf,
 ) {
-    let UnbufferedStatus { state, .. } = conn.process_tls_records(&mut in_buf[..filled]);
+    let UnbufferedStatus { state, .. } = conn.step(&mut in_buf[..filled]);
     if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state {
         if let Ok(n) = enc.encode(out_buf) {
             let _ = send_all(socket, &out_buf[..n]).await;

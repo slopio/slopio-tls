@@ -7,10 +7,9 @@ use runtime::net::{
     socket_send_control_record,
 };
 use runtime_streams::Stream;
+use rustls::server::ServerConnectionData;
 
-use crate::ktls::{
-    ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, TLS_RECORD_TYPE_ALERT,
-};
+use crate::ktls::{ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, TLS_RECORD_TYPE_ALERT};
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
 ///
@@ -104,8 +103,8 @@ impl AsRef<[u8]> for Frame {
 /// error variant (e.g., `io::ErrorKind::UnexpectedEof` for case 2) or a
 /// post-end query method (`ended_gracefully() -> bool`). Neither is currently
 /// implemented because the application-level fix above is strictly better.
-pub struct KtlsMessages {
-    ktls: KtlsSocket,
+pub struct KtlsMessages<S = ServerConnectionData> {
+    ktls: KtlsSocket<S>,
     bgid: BufGroup,
     state: State,
 }
@@ -122,10 +121,10 @@ enum State {
     Done,
 }
 
-impl Unpin for KtlsMessages {}
+impl<S> Unpin for KtlsMessages<S> {}
 
-impl KtlsSocket {
-    pub fn into_messages(self, bgid: BufGroup) -> KtlsMessages {
+impl<S> KtlsSocket<S> {
+    pub fn into_messages(self, bgid: BufGroup) -> KtlsMessages<S> {
         let recv = MultiRecv::new(self.fd(), bgid);
         KtlsMessages {
             ktls: self,
@@ -135,7 +134,7 @@ impl KtlsSocket {
     }
 }
 
-impl KtlsMessages {
+impl<S> KtlsMessages<S> {
     pub fn alpn(&self) -> Option<&'static [u8]> {
         self.ktls.alpn()
     }
@@ -164,7 +163,7 @@ impl KtlsMessages {
     }
 }
 
-impl Stream for KtlsMessages {
+impl<S> Stream for KtlsMessages<S> {
     type Item = std::io::Result<Frame>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -198,9 +197,7 @@ impl Stream for KtlsMessages {
                     Poll::Ready(Some(Ok(buf))) => {
                         return Poll::Ready(Some(Ok(Frame::Borrowed(buf))));
                     }
-                    Poll::Ready(Some(Err(CompletionError::Other(code))))
-                        if code == -libc::EIO =>
-                    {
+                    Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
                         match this.ktls.handle_control_record() {
                             Ok(ControlAction::Continue) => {
                                 let recv = MultiRecv::new(this.ktls.fd(), this.bgid);

@@ -5,9 +5,9 @@ use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
 
 use crate::pool::PooledBuf;
 
-pub struct KtlsSocket {
+pub struct KtlsSocket<S = ServerConnectionData> {
     socket: SocketWrapper,
-    pub(crate) kernel_conn: KernelConnection<ServerConnectionData>,
+    pub(crate) kernel_conn: KernelConnection<S>,
     pub(crate) alpn: Option<&'static [u8]>,
     pub(crate) pending_plaintext: Option<Vec<u8>>,
     pub(crate) tx_records: u64,
@@ -35,7 +35,7 @@ pub(crate) enum ControlAction {
     },
 }
 
-impl KtlsSocket {
+impl<S> KtlsSocket<S> {
     pub fn fd(&self) -> i32 {
         self.socket.fd
     }
@@ -74,7 +74,7 @@ impl KtlsSocket {
     pub(crate) fn establish(
         socket: SocketWrapper,
         secrets: ExtractedSecrets,
-        kernel_conn: KernelConnection<ServerConnectionData>,
+        kernel_conn: KernelConnection<S>,
         alpn: Option<&'static [u8]>,
         pending_plaintext: Option<Vec<u8>>,
     ) -> std::io::Result<Self> {
@@ -104,6 +104,92 @@ impl KtlsSocket {
             pending_plaintext,
             tx_records: 0,
         })
+    }
+
+    /// Walk every TLS 1.3 handshake message inside one post-handshake record,
+    /// applying side effects as we go. Returns `Err(ControlAction::SendFatal)`
+    /// on protocol violations so the caller can return it up the stack.
+    fn process_handshake_messages(&mut self, mut payload: &[u8]) -> Result<(), ControlAction> {
+        while !payload.is_empty() {
+            if payload.len() < 4 {
+                return Err(ControlAction::SendFatal {
+                    payload: &FATAL_DECODE_ERROR,
+                    err: std::io::Error::other("truncated handshake message"),
+                });
+            }
+            let body_len =
+                u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
+            if 4 + body_len > payload.len() {
+                return Err(ControlAction::SendFatal {
+                    payload: &FATAL_DECODE_ERROR,
+                    err: std::io::Error::other("handshake message length overruns record"),
+                });
+            }
+            let msg_type = payload[0];
+            let body = &payload[4..4 + body_len];
+            match msg_type {
+                HANDSHAKE_KEY_UPDATE => {
+                    // RFC 8446 §4.6.3: KeyUpdate body is a single byte.
+                    if body.len() != 1 {
+                        return Err(ControlAction::SendFatal {
+                            payload: &FATAL_DECODE_ERROR,
+                            err: std::io::Error::other("KeyUpdate: bad length"),
+                        });
+                    }
+                    let request_update = match body[0] {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(ControlAction::SendFatal {
+                                payload: &FATAL_ILLEGAL_PARAMETER,
+                                err: std::io::Error::other(
+                                    "KeyUpdate: KeyUpdateRequest must be 0 or 1",
+                                ),
+                            });
+                        }
+                    };
+                    let (seq, secret) =
+                        self.kernel_conn.update_rx_secret().map_err(|e| {
+                            ControlAction::SendFatal {
+                                payload: &FATAL_DECODE_ERROR,
+                                err: std::io::Error::other(format!("update_rx_secret: {e:?}")),
+                            }
+                        })?;
+                    unsafe {
+                        set_crypto_info(self.socket.fd, TLS_RX, seq, &secret).map_err(|e| {
+                            ControlAction::SendFatal {
+                                payload: &FATAL_DECODE_ERROR,
+                                err: e,
+                            }
+                        })?;
+                    }
+                    if request_update {
+                        self.initiate_key_update().map_err(|e| {
+                            ControlAction::SendFatal {
+                                payload: &FATAL_DECODE_ERROR,
+                                err: e,
+                            }
+                        })?;
+                    }
+                }
+                HANDSHAKE_NEW_SESSION_TICKET => {
+                    // We don't implement TLS 1.3 resumption (yet), so the
+                    // ticket is dropped on the floor. Once resumption is
+                    // wired up, this is where the body would be handed to
+                    // `KernelConnection<ClientConnectionData>::handle_new_session_ticket`.
+                }
+                _ => {
+                    return Err(ControlAction::SendFatal {
+                        payload: &FATAL_UNEXPECTED_MESSAGE,
+                        err: std::io::Error::other(
+                            "unexpected post-handshake handshake message",
+                        ),
+                    });
+                }
+            }
+            payload = &payload[4 + body_len..];
+        }
+        Ok(())
     }
 
     /// Read the control record the kernel is holding (signalled by an EIO
@@ -144,45 +230,21 @@ impl KtlsSocket {
         // alert; the catch-all treats `n == 0` with no cmsg as End.
         match cmsg.record_type {
             TLS_RECORD_TYPE_HANDSHAKE => {
-                // RFC 8446 §4.6.3: KeyUpdate = HandshakeType(1) || uint24
-                // length(=1) || KeyUpdateRequest(1).
-                // - Length wrong (record size, or length field) → decode_error.
-                // - Message type isn't KeyUpdate (no other handshake message
-                //   is valid post-handshake from the client) → unexpected_message.
-                // - Request byte not 0/1 → illegal_parameter.
-                if n != 5 || payload[1..4] != [0, 0, 1] {
-                    return Ok(ControlAction::SendFatal {
-                        payload: &FATAL_DECODE_ERROR,
-                        err: std::io::Error::other("malformed handshake record"),
-                    });
-                }
-                if payload[0] != HANDSHAKE_KEY_UPDATE {
-                    return Ok(ControlAction::SendFatal {
-                        payload: &FATAL_UNEXPECTED_MESSAGE,
-                        err: std::io::Error::other("unexpected post-handshake handshake message"),
-                    });
-                }
-                let request_update = match payload[4] {
-                    0 => false,
-                    1 => true,
-                    _ => {
-                        return Ok(ControlAction::SendFatal {
-                            payload: &FATAL_ILLEGAL_PARAMETER,
-                            err: std::io::Error::other(
-                                "KeyUpdate: KeyUpdateRequest must be 0 or 1",
-                            ),
-                        });
-                    }
-                };
-                let (seq, secret) = self
-                    .kernel_conn
-                    .update_rx_secret()
-                    .map_err(|e| std::io::Error::other(format!("update_rx_secret: {e:?}")))?;
-                unsafe {
-                    set_crypto_info(self.socket.fd, TLS_RX, seq, &secret)?;
-                }
-                if request_update {
-                    self.initiate_key_update()?;
+                // RFC 8446 §4: every post-handshake message starts with
+                // HandshakeType(1) || uint24 length || body. A single record
+                // can carry multiple messages back-to-back (rustls servers
+                // coalesce all four default NewSessionTickets into one
+                // record), so we loop until the record is consumed.
+                //
+                // We accept two message types here:
+                //   - KeyUpdate (24): rekey RX, optionally TX.
+                //   - NewSessionTicket (4): silently discard. We don't
+                //     implement resumption yet, and the server sends these
+                //     by default in TLS 1.3.
+                // Anything else is unexpected_message; malformed framing is
+                // decode_error.
+                if let Err(action) = self.process_handshake_messages(&payload[..n]) {
+                    return Ok(action);
                 }
                 Ok(ControlAction::Continue)
             }
@@ -222,6 +284,7 @@ const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 pub(crate) const TLS_RECORD_TYPE_ALERT: u8 = 21;
 const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
+const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
 const TLS_1_3_VERSION: u16 = 0x0304;
 
 const KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0];
