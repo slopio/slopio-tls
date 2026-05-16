@@ -2,10 +2,15 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
-use runtime::net::{BorrowedBuffer, BufGroup, MultiRecv, socket_send};
+use runtime::net::{
+    BorrowedBuffer, BufGroup, MultiRecv, WriteControlRecord, socket_send,
+    socket_send_control_record,
+};
 use runtime_streams::Stream;
 
-use crate::ktls::{ControlOutcome, KtlsSocket};
+use crate::ktls::{
+    ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, TLS_RECORD_TYPE_ALERT,
+};
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
 ///
@@ -37,9 +42,16 @@ impl AsRef<[u8]> for Frame {
 /// `None` indicates the stream has ended. `Err` items signal transport-level
 /// failures (RST, etc.).
 ///
-/// TLS 1.3 control records (KeyUpdate, post-handshake alerts) are handled
-/// internally: KeyUpdate causes transparent re-keying and stream continuation;
-/// close_notify and fatal alerts cause the stream to end (`None`).
+/// TLS 1.3 control records are handled internally:
+/// - **KeyUpdate**: transparent re-keying; the stream keeps yielding frames.
+/// - **Peer alert** (close_notify or any other, since TLS 1.3 treats every
+///   non-close_notify alert as fatal per RFC 8446 §6): the stream ends with
+///   `None`. No reciprocal alert is sent — the peer initiated the close.
+/// - **Local-side protocol violation** (malformed control record, AEAD
+///   verification failure): a fatal alert is encoded and sent over kTLS via
+///   io_uring before the stream surfaces the error via `Some(Err(_))`. The
+///   alert send is awaited inside `poll_next`, so the caller's `.await`
+///   returns only once the peer has been notified.
 ///
 /// # Truncation detection
 ///
@@ -100,6 +112,13 @@ pub struct KtlsMessages {
 
 enum State {
     Recving(MultiRecv),
+    /// A fatal alert is being sent over kTLS in response to a protocol
+    /// violation we detected on the recv side. Once the send completes the
+    /// stream transitions to `Done` and surfaces `err` to the caller.
+    SendingFatal {
+        send: WriteControlRecord<'static>,
+        err: Option<std::io::Error>,
+    },
     Done,
 }
 
@@ -158,6 +177,18 @@ impl Stream for KtlsMessages {
         loop {
             match &mut this.state {
                 State::Done => return Poll::Ready(None),
+                State::SendingFatal { send, err } => match Pin::new(send).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        // Best-effort: whether the alert reached the peer or
+                        // not, we always surface the original error and end.
+                        let e = err
+                            .take()
+                            .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
+                        this.state = State::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
                 State::Recving(recv) => match Pin::new(recv).poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
@@ -170,17 +201,47 @@ impl Stream for KtlsMessages {
                     Poll::Ready(Some(Err(CompletionError::Other(code))))
                         if code == -libc::EIO =>
                     {
-                        this.state = State::Done;
                         match this.ktls.handle_control_record() {
-                            Ok(ControlOutcome::KeyUpdate) => {
+                            Ok(ControlAction::Continue) => {
                                 let recv = MultiRecv::new(this.ktls.fd(), this.bgid);
                                 this.state = State::Recving(recv);
                             }
-                            Ok(ControlOutcome::Eof) | Ok(ControlOutcome::Alert { .. }) => {
+                            Ok(ControlAction::End) => {
+                                this.state = State::Done;
                                 return Poll::Ready(None);
                             }
-                            Err(e) => return Poll::Ready(Some(Err(e))),
+                            Ok(ControlAction::SendFatal { payload, err }) => {
+                                let send = socket_send_control_record(
+                                    this.ktls.as_socket(),
+                                    TLS_RECORD_TYPE_ALERT,
+                                    payload,
+                                );
+                                this.state = State::SendingFatal {
+                                    send,
+                                    err: Some(err),
+                                };
+                            }
+                            Err(e) => {
+                                this.state = State::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
                         }
+                    }
+                    Poll::Ready(Some(Err(CompletionError::Other(code))))
+                        if code == -libc::EBADMSG =>
+                    {
+                        // AEAD verification failure: the kernel discarded a
+                        // record we couldn't decrypt. Notify the peer with
+                        // a `bad_record_mac` fatal alert (RFC 8446 §6).
+                        let send = socket_send_control_record(
+                            this.ktls.as_socket(),
+                            TLS_RECORD_TYPE_ALERT,
+                            &FATAL_BAD_RECORD_MAC,
+                        );
+                        this.state = State::SendingFatal {
+                            send,
+                            err: Some(std::io::Error::from_raw_os_error(libc::EBADMSG)),
+                        };
                     }
                     Poll::Ready(Some(Err(e))) => {
                         this.state = State::Done;

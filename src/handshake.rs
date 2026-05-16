@@ -97,7 +97,33 @@ async fn handshake_inner(
         let UnbufferedStatus { discard, state } =
             conn.process_tls_records(&mut in_buf[..filled]);
 
-        match state? {
+        let s = match state {
+            Ok(s) => s,
+            Err(e) => {
+                // rustls stages a fatal alert into its outbound queue before
+                // surfacing the error; one more pass drains that alert as
+                // EncodeTlsData so the peer learns *why* the handshake aborted
+                // instead of just seeing the TCP close. We must pass the same
+                // buffer rustls saw, because its internal BufferProgress is
+                // re-derived from `hs_deframer.outer_discard` each call and
+                // indexes into the buffer (passing `&mut []` here panics in
+                // rustls when partial handshake data is buffered).
+                //
+                // Note: rustls does NOT queue an alert for every error. Some
+                // record-layer violations (e.g.
+                // `PeerMisbehaved::MessageInterleavedWithHandshakeMessage` at
+                // rustls-0.23.40/src/conn.rs:1062) return a bare `Err` without
+                // calling `send_fatal_alert`. For those, this drain finds an
+                // empty `sendable_tls`, returns the same error again, and the
+                // peer sees a TCP close instead of a fatal alert. That is a
+                // rustls upstream gap, not something we can fix here without
+                // hand-encoding alerts with rustls's internal handshake keys.
+                drain_pending_alert(&mut conn, &socket, &mut in_buf, filled, &mut out_buf).await;
+                return Err(HandshakeError::Rustls(e));
+            }
+        };
+
+        match s {
             ConnectionState::EncodeTlsData(mut enc) => {
                 let n = enc.encode(&mut out_buf)?;
                 send_all(&socket, &out_buf[..n]).await?;
@@ -169,6 +195,33 @@ async fn recv_more(
     }
     *filled += n;
     Ok(())
+}
+
+/// After `process_tls_records` returns `Err`, rustls has queued a fatal alert
+/// in its outbound buffer. Drain it (encrypted with the keys negotiated so far)
+/// so the peer gets a TLS-level reason for the handshake failure. Best-effort:
+/// any further error here is swallowed — we're already on the error path.
+///
+/// We pass the same buffer rustls saw on the failing call (must be the same
+/// slice contents and length, because rustls's `BufferProgress` is re-derived
+/// from `hs_deframer.outer_discard` each call and indexes into the buffer).
+/// The sendable_tls check inside rustls runs *before* the deframer, so the
+/// queued alert surfaces as `EncodeTlsData` on the next call. A fatal alert
+/// is a single record, so one pass is enough; calling again after sending
+/// would land in the deframer with a stale buffer and panic.
+async fn drain_pending_alert(
+    conn: &mut UnbufferedServerConnection,
+    socket: &SocketWrapper,
+    in_buf: &mut PooledBuf,
+    filled: usize,
+    out_buf: &mut PooledBuf,
+) {
+    let UnbufferedStatus { state, .. } = conn.process_tls_records(&mut in_buf[..filled]);
+    if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state {
+        if let Ok(n) = enc.encode(out_buf) {
+            let _ = send_all(socket, &out_buf[..n]).await;
+        }
+    }
 }
 
 async fn send_all(socket: &SocketWrapper, mut data: &[u8]) -> Result<(), HandshakeError> {

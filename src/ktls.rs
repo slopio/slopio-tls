@@ -13,11 +13,26 @@ pub struct KtlsSocket {
     pub(crate) tx_records: u64,
 }
 
+/// Result of inspecting a control record delivered via the kTLS recvmsg cmsg
+/// path. The caller (the `KtlsMessages` state machine) decides what to do
+/// next; this enum carries no I/O of its own.
 #[derive(Debug)]
-pub enum ControlOutcome {
-    Eof,
-    KeyUpdate,
-    Alert { level: u8, description: u8 },
+pub(crate) enum ControlAction {
+    /// A valid KeyUpdate was processed (RX rekeyed, optional TX rekey already
+    /// emitted via the synchronous `initiate_key_update` path). Continue
+    /// receiving on the same socket.
+    Continue,
+    /// Peer ended the stream cleanly (close_notify alert, any other alert
+    /// — RFC 8446 §6 treats all non-close_notify alerts as fatal — or zero-
+    /// length recv = EOF). No reply needed; move to `Done`.
+    End,
+    /// Local-side protocol violation detected. Caller should encrypt and
+    /// send this 2-byte fatal alert payload over kTLS before surfacing the
+    /// accompanying error.
+    SendFatal {
+        payload: &'static [u8; 2],
+        err: std::io::Error,
+    },
 }
 
 impl KtlsSocket {
@@ -89,7 +104,12 @@ impl KtlsSocket {
         })
     }
 
-    pub fn handle_control_record(&mut self) -> std::io::Result<ControlOutcome> {
+    /// Read the control record the kernel is holding (signalled by an EIO
+    /// completion on the recv ring) and decide how the stream should react.
+    /// This function performs the sync recvmsg and any RX rekey (KeyUpdate)
+    /// inline, but never sends an alert itself — alert emission is async and
+    /// driven by the caller's state machine.
+    pub(crate) fn handle_control_record(&mut self) -> std::io::Result<ControlAction> {
         let mut payload = PooledBuf::new();
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr() as *mut libc::c_void,
@@ -113,29 +133,45 @@ impl KtlsSocket {
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if n == 0 {
-            return Ok(ControlOutcome::Eof);
-        }
         let n = n as usize;
 
+        // `n == 0` is ambiguous: it can be a TCP EOF (no cmsg attached) or a
+        // zero-byte control-record payload (cmsg present, e.g. a malformed
+        // empty alert). We let the match dispatch handle both correctly:
+        // ALERT/HANDSHAKE arms validate length and emit the right fatal
+        // alert; the catch-all treats `n == 0` with no cmsg as End.
         match cmsg.record_type {
             TLS_RECORD_TYPE_HANDSHAKE => {
-                // RFC 8446 §4.6.3: KeyUpdate = HandshakeType(1) || uint24 length(=1) || KeyUpdateRequest(1)
-                if n != 5
-                    || payload[0] != HANDSHAKE_KEY_UPDATE
-                    || payload[1..4] != [0, 0, 1]
-                {
-                    return Err(std::io::Error::other(
-                        "unexpected post-handshake handshake message",
-                    ));
+                // RFC 8446 §4.6.3: KeyUpdate = HandshakeType(1) || uint24
+                // length(=1) || KeyUpdateRequest(1).
+                // - Length wrong (record size, or length field) → decode_error.
+                // - Message type isn't KeyUpdate (no other handshake message
+                //   is valid post-handshake from the client) → unexpected_message.
+                // - Request byte not 0/1 → illegal_parameter.
+                if n != 5 || payload[1..4] != [0, 0, 1] {
+                    return Ok(ControlAction::SendFatal {
+                        payload: &FATAL_DECODE_ERROR,
+                        err: std::io::Error::other("malformed handshake record"),
+                    });
+                }
+                if payload[0] != HANDSHAKE_KEY_UPDATE {
+                    return Ok(ControlAction::SendFatal {
+                        payload: &FATAL_UNEXPECTED_MESSAGE,
+                        err: std::io::Error::other(
+                            "unexpected post-handshake handshake message",
+                        ),
+                    });
                 }
                 let request_update = match payload[4] {
                     0 => false,
                     1 => true,
                     _ => {
-                        return Err(std::io::Error::other(
-                            "KeyUpdate: KeyUpdateRequest must be 0 or 1",
-                        ));
+                        return Ok(ControlAction::SendFatal {
+                            payload: &FATAL_ILLEGAL_PARAMETER,
+                            err: std::io::Error::other(
+                                "KeyUpdate: KeyUpdateRequest must be 0 or 1",
+                            ),
+                        });
                     }
                 };
                 let (seq, secret) = self
@@ -146,28 +182,32 @@ impl KtlsSocket {
                 if request_update {
                     self.initiate_key_update()?;
                 }
-                Ok(ControlOutcome::KeyUpdate)
+                Ok(ControlAction::Continue)
             }
             TLS_RECORD_TYPE_ALERT => {
+                // Per RFC 8446 §6, alert records carry exactly 2 bytes
+                // (level + description); shorter is malformed → decode_error.
                 if n < 2 {
-                    return Err(std::io::Error::other("truncated alert record"));
+                    return Ok(ControlAction::SendFatal {
+                        payload: &FATAL_DECODE_ERROR,
+                        err: std::io::Error::other("truncated alert record"),
+                    });
                 }
-                Ok(ControlOutcome::Alert {
-                    level: payload[0],
-                    description: payload[1],
-                })
+                // Any peer alert ends the stream. TLS 1.3 treats every alert
+                // except close_notify/user_canceled as fatal anyway; we
+                // simply stop receiving and let the caller surface `None`.
+                Ok(ControlAction::End)
             }
-            other => Err(std::io::Error::other(format!(
-                "unexpected TLS record type {other}"
-            ))),
-        }
-    }
-}
-
-impl Drop for KtlsSocket {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = send_close_notify(self.socket.fd);
+            0 if n == 0 => {
+                // No cmsg, no bytes — TCP EOF on a connection where kTLS
+                // had signalled a control record waiting but the peer
+                // disappeared before recvmsg could pull it.
+                Ok(ControlAction::End)
+            }
+            _ => Ok(ControlAction::SendFatal {
+                payload: &FATAL_UNEXPECTED_MESSAGE,
+                err: std::io::Error::other("unexpected TLS record type"),
+            }),
         }
     }
 }
@@ -177,13 +217,20 @@ const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
 const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
-const TLS_RECORD_TYPE_ALERT: u8 = 21;
+pub(crate) const TLS_RECORD_TYPE_ALERT: u8 = 21;
 const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
 const TLS_1_3_VERSION: u16 = 0x0304;
 
-const CLOSE_NOTIFY_PAYLOAD: [u8; 2] = [1, 0];
 const KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0];
+
+// RFC 8446 §6 fatal alert payloads. Static so the async send future can
+// borrow them with a `'static` lifetime and live in the `KtlsMessages`
+// state machine without a self-referential struct.
+pub(crate) static FATAL_UNEXPECTED_MESSAGE: [u8; 2] = [2, 10];
+pub(crate) static FATAL_BAD_RECORD_MAC: [u8; 2] = [2, 20];
+pub(crate) static FATAL_ILLEGAL_PARAMETER: [u8; 2] = [2, 47];
+pub(crate) static FATAL_DECODE_ERROR: [u8; 2] = [2, 50];
 
 const TLS_CIPHER_AES_GCM_128: u16 = 51;
 const TLS_CIPHER_AES_GCM_256: u16 = 52;
@@ -329,10 +376,11 @@ struct TlsCmsg {
     record_type: u8,
 }
 
-unsafe fn send_close_notify(fd: i32) -> std::io::Result<()> {
-    unsafe { send_control_record(fd, TLS_RECORD_TYPE_ALERT, &CLOSE_NOTIFY_PAYLOAD) }
-}
-
+/// Synchronous control-record send. Used only by `initiate_key_update`,
+/// which is application-initiated and not on the error path, so a blocking
+/// sendmsg syscall (returns immediately on a non-blocking socket for a
+/// 5-byte payload) is acceptable. Fatal-alert sends go through the async
+/// `runtime::net::socket_send_control_record` path instead.
 unsafe fn send_control_record(
     fd: i32,
     record_type: u8,

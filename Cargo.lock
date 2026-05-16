@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 dependencies = [
  "slab",
  "smallvec",
@@ -100,7 +100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -152,7 +152,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 dependencies = [
  "io-uring",
  "rustix",
@@ -349,6 +349,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
+ "aws-lc-rs",
  "pem",
  "ring",
  "rustls-pki-types",
@@ -373,7 +374,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 dependencies = [
  "libc",
  "mimalloc",
@@ -383,7 +384,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 dependencies = [
  "async_timers",
  "bumpalo",
@@ -403,12 +404,12 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 
 [[package]]
 name = "runtime_ebpf_balancer"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#cb0c14031d93f2dd384845ba8199bc48f2c75800"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
 dependencies = [
  "libc",
  "object",
@@ -424,7 +425,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
