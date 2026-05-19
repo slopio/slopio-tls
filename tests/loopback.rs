@@ -1,3 +1,4 @@
+use std::io::IoSlice;
 use std::net::TcpListener;
 use std::sync::Once;
 use std::sync::mpsc;
@@ -181,6 +182,155 @@ fn client_downloads_large_file_intact() {
                     received[i], expected[i]
                 );
             }
+        });
+    });
+
+    client.join().expect("client thread");
+    server.join().expect("server thread");
+}
+
+/// Server gathers three plaintext slices into a single `send_vectored` call;
+/// the middle slice is 2 MiB of deterministic bytes, large enough to span
+/// many 16 KiB TLS records and force the partial-write `advance_slices`
+/// loop to run multiple times. Client reassembles and verifies the
+/// concatenation byte-for-byte.
+#[test]
+fn vectored_send_round_trip() {
+    init_provider();
+    const MID_LEN: usize = 2 * 1024 * 1024;
+    const SEED: u64 = 0x1234_5678_ABCD_EF01;
+    const PREFIX: &[u8] = b"PREFIX|";
+    const SUFFIX: &[u8] = b"|SUFFIX";
+
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = make_server_config();
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("server handshake");
+
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let body = deterministic_payload(MID_LEN, SEED);
+            let mut slices = [
+                IoSlice::new(PREFIX),
+                IoSlice::new(&body),
+                IoSlice::new(SUFFIX),
+            ];
+            stream
+                .send_vectored(&mut slices)
+                .await
+                .expect("send_vectored");
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let client = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = client_config_dangerous_no_verification(None).expect("client config");
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let ktls = connect(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                server_name,
+                cfg,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client connect");
+
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut received = Vec::with_capacity(MID_LEN + PREFIX.len() + SUFFIX.len());
+            while let Some(item) = stream.next().await {
+                let frame = item.expect("frame ok");
+                received.extend_from_slice(frame.as_ref());
+            }
+
+            let body = deterministic_payload(MID_LEN, SEED);
+            let mut expected = Vec::with_capacity(MID_LEN + PREFIX.len() + SUFFIX.len());
+            expected.extend_from_slice(PREFIX);
+            expected.extend_from_slice(&body);
+            expected.extend_from_slice(SUFFIX);
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "length mismatch: got {}, expected {}",
+                received.len(),
+                expected.len()
+            );
+            if let Some(i) = received.iter().zip(&expected).position(|(a, b)| a != b) {
+                panic!(
+                    "byte mismatch at offset {i}: got {:#04x}, expected {:#04x}",
+                    received[i], expected[i]
+                );
+            }
+        });
+    });
+
+    client.join().expect("client thread");
+    server.join().expect("server thread");
+}
+
+/// Server sends "before", initiates a TLS 1.3 KeyUpdate (rotating its
+/// TX secret and rearming `kTLS_TX`), then sends "after" under the new
+/// key. Client must transparently process the KeyUpdate control record
+/// — `handle_control_record` decodes it, rotates `kTLS_RX`, and the
+/// stream re-arms its MultiRecv — and surface both payloads as ordinary
+/// frames. If the rekey on either side were broken, "after" would
+/// either fail to decrypt (EBADMSG → stream error) or never decode.
+#[test]
+fn server_initiated_key_update_round_trip() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = make_server_config();
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("server handshake");
+
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            stream.send(b"before").await.expect("send before");
+            stream.initiate_key_update().expect("initiate_key_update");
+            stream.send(b"after").await.expect("send after");
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let client = thread::spawn(move || {
+        main_thread(async move {
+            let cfg = client_config_dangerous_no_verification(None).expect("client config");
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let ktls = connect(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                server_name,
+                cfg,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client connect");
+
+            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut received = Vec::new();
+            while let Some(item) = stream.next().await {
+                let frame = item.expect("frame ok");
+                received.extend_from_slice(frame.as_ref());
+            }
+            assert_eq!(
+                received, b"beforeafter",
+                "client missed a frame across the KeyUpdate boundary"
+            );
         });
     });
 

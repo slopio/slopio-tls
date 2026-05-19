@@ -1,10 +1,11 @@
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
 use runtime::net::{
     BorrowedBuffer, BufGroup, MultiRecv, WriteControlRecord, socket_send,
-    socket_send_control_record,
+    socket_send_control_record, socket_send_vectored,
 };
 use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
@@ -158,6 +159,32 @@ impl<S> KtlsMessages<S> {
             }
             self.ktls.tx_records += n.div_ceil(16384) as u64;
             data = &data[n..];
+        }
+        Ok(())
+    }
+
+    /// Gather-write the supplied plaintext slices into the kTLS socket.
+    ///
+    /// The kernel packs the concatenated plaintext into TLS 1.3 records (up
+    /// to 16 384 bytes of plaintext each) before encrypting and emitting them
+    /// on the wire, so a vectored send is the cheapest way to coalesce
+    /// scattered buffers into the minimum number of records.
+    ///
+    /// `bufs` is advanced past any partially-written prefix on each iteration,
+    /// so the caller's slice ends empty on `Ok(())`.
+    pub async fn send_vectored(&mut self, mut bufs: &mut [IoSlice<'_>]) -> std::io::Result<()> {
+        let mut remaining: usize = bufs.iter().map(|b| b.len()).sum();
+        while remaining > 0 {
+            let n = socket_send_vectored(self.ktls.as_socket(), bufs).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "send returned 0",
+                ));
+            }
+            self.ktls.tx_records += n.div_ceil(16384) as u64;
+            remaining -= n;
+            IoSlice::advance_slices(&mut bufs, n);
         }
         Ok(())
     }
