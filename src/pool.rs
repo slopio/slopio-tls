@@ -83,7 +83,10 @@ pub(crate) struct PooledScratch {
 
 impl PooledScratch {
     pub fn new(cap: usize) -> Self {
-        assert!(cap <= BUFFER_SIZE, "scratch cap {cap} exceeds pool buffer size");
+        assert!(
+            cap <= BUFFER_SIZE,
+            "scratch cap {cap} exceeds pool buffer size"
+        );
         Self {
             buf: PooledBuf::new(),
             cap,
