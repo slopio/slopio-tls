@@ -41,7 +41,11 @@ fn main() {
         println!("handshake done");
 
         let mut stream = ktls.into_messages(BufGroup::Medium);
-        stream.send(b"hello from popple client\n").await.expect("send");
+        stream
+            .send(b"hello from popple client\n")
+            .await
+            .0
+            .expect("send");
 
         match stream.next().await {
             Some(Ok(frame)) => {

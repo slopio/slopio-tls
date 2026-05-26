@@ -51,7 +51,7 @@ fn main() {
         );
 
         let mut stream = ktls.into_messages(BufGroup::Medium);
-        stream.send(req.as_bytes()).await.expect("send request");
+        stream.send(req.into_bytes()).await.0.expect("send request");
 
         let mut total = 0usize;
         let mut first_chunk = true;

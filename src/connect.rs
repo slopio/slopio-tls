@@ -37,7 +37,7 @@ pub async fn connect(
     config: ClientConfig,
     deadline: Duration,
 ) -> Result<KtlsSocket<ClientConnectionData>, HandshakeError> {
-    let socket = connect_tcp(addr)?;
+    let socket = connect_tcp(addr).await?;
     let ClientConfig {
         rustls,
         alpn_protocols,

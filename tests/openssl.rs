@@ -62,6 +62,7 @@ fn handshake_then_send_response() {
                 .expect("handshake");
             socket_send(ktls.as_socket(), b"HELLO_FROM_KTLS\n")
                 .await
+                .0
                 .expect("send");
         });
     });
@@ -113,7 +114,7 @@ fn echo_round_trip() {
                 .await
                 .expect("stream ended")
                 .expect("recv");
-            stream.send(frame.as_ref()).await.expect("send");
+            stream.send(frame.as_ref().to_vec()).await.0.expect("send");
             // dropping stream here sends close_notify and closes the socket;
             // openssl client sees the close and exits.
         });
@@ -208,6 +209,7 @@ fn alpn_match_succeeds_and_exposes_negotiated_protocol() {
             assert_eq!(ktls.alpn(), Some(b"http/1.1" as &[u8]));
             socket_send(ktls.as_socket(), b"ALPN_OK\n")
                 .await
+                .0
                 .expect("send");
         });
     });
@@ -305,7 +307,7 @@ fn stream_echo_round_trip() {
                 match item {
                     Ok(frame) => {
                         let data: &[u8] = frame.as_ref();
-                        if stream.send(data).await.is_err() {
+                        if stream.send(data.to_vec()).await.0.is_err() {
                             break;
                         }
                     }
@@ -368,7 +370,7 @@ fn peer_initiated_key_update_round_trip() {
                 match item {
                     Ok(frame) => {
                         let data: &[u8] = frame.as_ref();
-                        if stream.send(data).await.is_err() {
+                        if stream.send(data.to_vec()).await.0.is_err() {
                             break;
                         }
                     }
@@ -440,6 +442,7 @@ fn server_initiated_key_update_round_trip() {
             stream
                 .send(b"BEFORE_ROTATION\n")
                 .await
+                .0
                 .expect("send before");
             assert!(
                 stream.tx_records() > 0,
@@ -453,7 +456,7 @@ fn server_initiated_key_update_round_trip() {
                 "tx_records should reset to 0 after key update"
             );
 
-            stream.send(b"AFTER_ROTATION\n").await.expect("send after");
+            stream.send(b"AFTER_ROTATION\n").await.0.expect("send after");
             assert!(
                 stream.tx_records() > 0,
                 "tx_records should increment again after post-rotation send"

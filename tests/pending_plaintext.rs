@@ -208,6 +208,7 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
             stream
                 .send(b"coalesced-with-finished")
                 .await
+                .0
                 .expect("send");
         });
     });

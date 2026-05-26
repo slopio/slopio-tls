@@ -1,4 +1,3 @@
-use std::io::IoSlice;
 use std::net::TcpListener;
 use std::sync::Once;
 use std::sync::mpsc;
@@ -83,7 +82,7 @@ fn client_and_server_round_trip() {
             let first = stream.next().await.expect("frame").expect("frame ok");
             let data: &[u8] = first.as_ref();
             assert_eq!(data, b"ping");
-            stream.send(b"pong").await.expect("send pong");
+            stream.send(b"pong").await.0.expect("send pong");
         });
     });
 
@@ -103,7 +102,7 @@ fn client_and_server_round_trip() {
             .expect("client connect");
 
             let mut stream = ktls.into_messages(BufGroup::Medium);
-            stream.send(b"ping").await.expect("send ping");
+            stream.send(b"ping").await.0.expect("send ping");
             let reply = stream.next().await.expect("reply").expect("reply ok");
             let data: &[u8] = reply.as_ref();
             assert_eq!(data, b"pong");
@@ -141,7 +140,7 @@ fn client_downloads_large_file_intact() {
 
             let mut stream = ktls.into_messages(BufGroup::Medium);
             let payload = deterministic_payload(FILE_LEN, SEED);
-            stream.send(&payload).await.expect("send payload");
+            stream.send(payload).await.0.expect("send payload");
             // Drop stream → socket → TCP FIN. Client sees end-of-stream.
         });
     });
@@ -217,15 +216,8 @@ fn vectored_send_round_trip() {
 
             let mut stream = ktls.into_messages(BufGroup::Medium);
             let body = deterministic_payload(MID_LEN, SEED);
-            let mut slices = [
-                IoSlice::new(PREFIX),
-                IoSlice::new(&body),
-                IoSlice::new(SUFFIX),
-            ];
-            stream
-                .send_vectored(&mut slices)
-                .await
-                .expect("send_vectored");
+            let bufs: Vec<Vec<u8>> = vec![PREFIX.to_vec(), body, SUFFIX.to_vec()];
+            stream.send_vectored(bufs).await.0.expect("send_vectored");
         });
     });
 
@@ -300,9 +292,9 @@ fn server_initiated_key_update_round_trip() {
                 .expect("server handshake");
 
             let mut stream = ktls.into_messages(BufGroup::Medium);
-            stream.send(b"before").await.expect("send before");
+            stream.send(b"before").await.0.expect("send before");
             stream.initiate_key_update().expect("initiate_key_update");
-            stream.send(b"after").await.expect("send after");
+            stream.send(b"after").await.0.expect("send after");
         });
     });
 

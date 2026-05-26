@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use runtime::net::{SocketWrapper, socket_recv_init, socket_send};
+use runtime::net::{IoBuf, SocketWrapper, send_all as runtime_send_all, socket_recv};
 use runtime::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::kernel::KernelConnection;
@@ -9,7 +9,7 @@ use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use crate::config::Config;
 use crate::ktls::KtlsSocket;
-use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf};
+use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf, PooledScratch};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -147,7 +147,7 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
                 // peer sees a TCP close instead of a fatal alert. That is a
                 // rustls upstream gap, not something we can fix here without
                 // hand-encoding alerts with rustls's internal handshake keys.
-                drain_pending_alert(&mut conn, &socket, &mut in_buf, filled, &mut out_buf).await;
+                drain_pending_alert(&mut conn, &socket, &mut in_buf, filled, out_buf).await;
                 return Err(HandshakeError::Rustls(e));
             }
         };
@@ -155,7 +155,9 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         match s {
             ConnectionState::EncodeTlsData(mut enc) => {
                 let n = enc.encode(&mut out_buf)?;
-                send_all(&socket, &out_buf[..n]).await?;
+                let (result, recovered) = send_all(&socket, out_buf, n).await;
+                out_buf = recovered;
+                result?;
             }
             ConnectionState::TransmitTlsData(t) => t.done(),
             ConnectionState::BlockedHandshake if handshake_done => {
@@ -220,10 +222,13 @@ async fn recv_more(
     if *filled == RECORD_BUF {
         return Err(HandshakeError::LeftoverBytes);
     }
-    let n = socket_recv_init(socket, &mut in_buf[*filled..], RECORD_BUF - *filled).await?;
+    let scratch = PooledScratch::new(RECORD_BUF - *filled);
+    let (result, scratch) = socket_recv(socket, scratch).await;
+    let n = result.map_err(HandshakeError::Io)?;
     if n == 0 {
         return Err(HandshakeError::PeerClosed);
     }
+    in_buf[*filled..*filled + n].copy_from_slice(&scratch[..n]);
     *filled += n;
     Ok(())
 }
@@ -245,26 +250,29 @@ async fn drain_pending_alert<C: UnbufferedDriver>(
     socket: &SocketWrapper,
     in_buf: &mut PooledBuf,
     filled: usize,
-    out_buf: &mut PooledBuf,
+    mut out_buf: PooledBuf,
 ) {
     let UnbufferedStatus { state, .. } = conn.step(&mut in_buf[..filled]);
     if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state {
-        if let Ok(n) = enc.encode(out_buf) {
-            let _ = send_all(socket, &out_buf[..n]).await;
+        if let Ok(n) = enc.encode(&mut out_buf) {
+            let _ = send_all(socket, out_buf, n).await;
         }
     }
 }
 
-async fn send_all(socket: &SocketWrapper, mut data: &[u8]) -> Result<(), HandshakeError> {
-    while !data.is_empty() {
-        let n = socket_send(socket, data).await?;
-        if n == 0 {
-            return Err(HandshakeError::Io(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "socket_send returned 0",
-            )));
-        }
-        data = &data[n..];
+/// Send the first `len` bytes of `out_buf` over `socket`, threading ownership
+/// of the pooled buffer through the io_uring submission so the kernel reads
+/// straight from the box (no copy, no extra alloc) and the buffer is handed
+/// back to the caller for reuse on the next encode/send pass.
+async fn send_all(
+    socket: &SocketWrapper,
+    out_buf: PooledBuf,
+    len: usize,
+) -> (Result<(), HandshakeError>, PooledBuf) {
+    if len == 0 {
+        return (Ok(()), out_buf);
     }
-    Ok(())
+    let slice = out_buf.slice(0..len);
+    let (result, slice) = runtime_send_all(socket, slice).await;
+    (result.map_err(HandshakeError::Io), slice.into_inner())
 }

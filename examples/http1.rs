@@ -43,7 +43,8 @@ fn main() {
                     println!("handshake done, negotiated ALPN = {}", alpn);
 
                     let mut stream = ktls.into_messages(BufGroup::Medium);
-                    if let Err(e) = stream.send(RESPONSE).await {
+                    let (result, _) = stream.send(RESPONSE).await;
+                    if let Err(e) = result {
                         eprintln!("send: {}", e);
                     }
                     drop(stream);

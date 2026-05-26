@@ -110,7 +110,7 @@ impl EchoServer {
                         while let Some(item) = stream.next().await {
                             let Ok(frame) = item else { break };
                             let data: &[u8] = frame.as_ref();
-                            if stream.send(data).await.is_err() {
+                            if stream.send(data.to_vec()).await.0.is_err() {
                                 break;
                             }
                         }

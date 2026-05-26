@@ -1,11 +1,11 @@
-use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
+use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
-    BorrowedBuffer, BufGroup, MultiRecv, WriteControlRecord, socket_send,
-    socket_send_control_record, socket_send_vectored,
+    BorrowedBuffer, BufGroup, IoBuf, MultiRecv, WriteControlRecord, send_all,
+    socket_send_control_record,
 };
 use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
@@ -148,45 +148,41 @@ impl<S> KtlsMessages<S> {
         self.ktls.initiate_key_update()
     }
 
-    pub async fn send(&mut self, mut data: &[u8]) -> std::io::Result<()> {
-        while !data.is_empty() {
-            let n = socket_send(self.ktls.as_socket(), data).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "send returned 0",
-                ));
-            }
-            self.ktls.tx_records += n.div_ceil(16384) as u64;
-            data = &data[n..];
+    /// Send the entire plaintext buffer over the kTLS socket, looping over
+    /// short writes internally. The buffer is handed back alongside the result
+    /// so the caller keeps their allocation regardless of success or failure.
+    ///
+    /// Takes ownership of `buf` because io_uring may keep reading from it after
+    /// the future is dropped (cancel-safety). Callers with `&[u8]` should
+    /// `.to_vec()` at the boundary; callers with `&'static [u8]` /
+    /// `&'static [u8; N]` can pass them directly (no allocation).
+    pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
+        let (result, buf) = send_all(self.ktls.as_socket(), buf).await;
+        if result.is_ok() {
+            self.ktls.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
         }
-        Ok(())
+        (result, buf)
     }
 
-    /// Gather-write the supplied plaintext slices into the kTLS socket.
+    /// Gather-write the supplied plaintext chunks into the kTLS socket.
     ///
     /// The kernel packs the concatenated plaintext into TLS 1.3 records (up
     /// to 16 384 bytes of plaintext each) before encrypting and emitting them
     /// on the wire, so a vectored send is the cheapest way to coalesce
     /// scattered buffers into the minimum number of records.
     ///
-    /// `bufs` is advanced past any partially-written prefix on each iteration,
-    /// so the caller's slice ends empty on `Ok(())`.
-    pub async fn send_vectored(&mut self, mut bufs: &mut [IoSlice<'_>]) -> std::io::Result<()> {
-        let mut remaining: usize = bufs.iter().map(|b| b.len()).sum();
-        while remaining > 0 {
-            let n = socket_send_vectored(self.ktls.as_socket(), bufs).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "send returned 0",
-                ));
-            }
-            self.ktls.tx_records += n.div_ceil(16384) as u64;
-            remaining -= n;
-            IoSlice::advance_slices(&mut bufs, n);
+    /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
+    /// handed back alongside the result.
+    pub async fn send_vectored<B: IoBuf>(
+        &mut self,
+        bufs: Vec<B>,
+    ) -> (std::io::Result<()>, Vec<B>) {
+        let (result, bufs) = send_vectored_all(self.ktls.as_socket(), bufs).await;
+        if result.is_ok() {
+            let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
+            self.ktls.tx_records += (total as u64).div_ceil(16384);
         }
-        Ok(())
+        (result, bufs)
     }
 }
 

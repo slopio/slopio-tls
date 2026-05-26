@@ -46,7 +46,8 @@ fn main() {
                                     data.len(),
                                     std::str::from_utf8(data).unwrap_or("<non-utf8>")
                                 );
-                                if let Err(e) = stream.send(data).await {
+                                let (result, _) = stream.send(data.to_vec()).await;
+                                if let Err(e) = result {
                                     eprintln!("send: {}", e);
                                     break;
                                 }

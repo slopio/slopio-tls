@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "slab",
  "smallvec",
@@ -40,6 +40,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bitfield-struct"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca6739863c590881f038d033a146c51ddae239186a4327014839fd864f44ed5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -47,9 +58,9 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "bumpalo"
-version = "3.20.2"
+version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "cc"
@@ -100,7 +111,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -152,7 +163,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "io-uring",
  "rustix",
@@ -192,9 +203,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "memchr"
@@ -213,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "object"
@@ -374,7 +385,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "libc",
  "mimalloc",
@@ -384,9 +395,10 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "async_timers",
+ "bitfield-struct",
  "bumpalo",
  "io-uring",
  "io_uring_rb",
@@ -404,12 +416,12 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 
 [[package]]
 name = "runtime_ebpf_balancer"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#b2dff25f194dd90c1ef4de60749334e89d052ae7"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c97d4d5188b30c60de963e746197b407fd758e1e"
 dependencies = [
  "libc",
  "object",
@@ -425,7 +437,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

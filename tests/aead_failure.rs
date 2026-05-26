@@ -142,7 +142,7 @@ fn aead_corruption_triggers_fatal_alert() {
                 .await
                 .expect("server handshake");
             let mut stream = ktls.into_messages(BufGroup::Medium);
-            stream.send(b"ready").await.expect("send ready");
+            stream.send(b"ready").await.0.expect("send ready");
             match stream.next().await {
                 Some(Err(e)) => server_err_tx.send(e).unwrap(),
                 Some(Ok(frame)) => panic!(
