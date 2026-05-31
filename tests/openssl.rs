@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use popple_tls::{Config, HandshakeError, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread;
-use runtime::net::BufGroup;
+use runtime::main_thread_with;
 use runtime::net::{MultiAccept, socket_send};
 use runtime_streams::StreamExt;
+
+mod common;
+use common::MediumRing;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -52,7 +54,7 @@ fn handshake_then_send_response() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -100,7 +102,7 @@ fn echo_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -108,7 +110,7 @@ fn echo_round_trip() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let frame = stream
                 .next()
                 .await
@@ -160,7 +162,7 @@ fn handshake_times_out_on_silent_peer() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -198,7 +200,7 @@ fn alpn_match_succeeds_and_exposes_negotiated_protocol() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -246,7 +248,7 @@ fn alpn_mismatch_rejects_handshake() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -294,7 +296,7 @@ fn stream_echo_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -302,7 +304,7 @@ fn stream_echo_round_trip() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(frame) => {
@@ -357,7 +359,7 @@ fn peer_initiated_key_update_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -365,7 +367,7 @@ fn peer_initiated_key_update_round_trip() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(frame) => {
@@ -428,7 +430,7 @@ fn server_initiated_key_update_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -437,7 +439,7 @@ fn server_initiated_key_update_round_trip() {
                 .await
                 .expect("handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
 
             stream
                 .send(b"BEFORE_ROTATION\n")

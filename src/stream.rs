@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
-    BorrowedBuffer, BufGroup, IoBuf, MultiRecv, WriteControlRecord, send_all,
+    BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, WriteControlRecord, send_all,
     socket_send_control_record,
 };
 use runtime_streams::Stream;
@@ -20,12 +20,12 @@ use crate::ktls::{ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, TLS_RECORD_TY
 /// buffer ring. Both implement `AsRef<[u8]>`, so callers can treat them
 /// uniformly.
 #[non_exhaustive]
-pub enum Frame {
+pub enum Frame<R: BufRingSpec> {
     Owned(Vec<u8>),
-    Borrowed(BorrowedBuffer),
+    Borrowed(BorrowedBuffer<R>),
 }
 
-impl AsRef<[u8]> for Frame {
+impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
     fn as_ref(&self) -> &[u8] {
         match self {
             Frame::Owned(v) => v.as_ref(),
@@ -104,14 +104,13 @@ impl AsRef<[u8]> for Frame {
 /// error variant (e.g., `io::ErrorKind::UnexpectedEof` for case 2) or a
 /// post-end query method (`ended_gracefully() -> bool`). Neither is currently
 /// implemented because the application-level fix above is strictly better.
-pub struct KtlsMessages<S = ServerConnectionData> {
+pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
     ktls: KtlsSocket<S>,
-    bgid: BufGroup,
-    state: State,
+    state: State<R>,
 }
 
-enum State {
-    Recving(MultiRecv),
+enum State<R: BufRingSpec> {
+    Recving(MultiRecv<R>),
     /// A fatal alert is being sent over kTLS in response to a protocol
     /// violation we detected on the recv side. Once the send completes the
     /// stream transitions to `Done` and surfaces `err` to the caller.
@@ -122,20 +121,19 @@ enum State {
     Done,
 }
 
-impl<S> Unpin for KtlsMessages<S> {}
+impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
-    pub fn into_messages(self, bgid: BufGroup) -> KtlsMessages<S> {
-        let recv = MultiRecv::new(self.fd(), bgid);
+    pub fn into_messages<R: BufRingSpec>(self) -> KtlsMessages<R, S> {
+        let recv = MultiRecv::new(self.fd());
         KtlsMessages {
             ktls: self,
-            bgid,
             state: State::Recving(recv),
         }
     }
 }
 
-impl<S> KtlsMessages<S> {
+impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     pub fn alpn(&self) -> Option<&'static [u8]> {
         self.ktls.alpn()
     }
@@ -186,8 +184,8 @@ impl<S> KtlsMessages<S> {
     }
 }
 
-impl<S> Stream for KtlsMessages<S> {
-    type Item = std::io::Result<Frame>;
+impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
+    type Item = std::io::Result<Frame<R>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -223,7 +221,7 @@ impl<S> Stream for KtlsMessages<S> {
                     Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
                         match this.ktls.handle_control_record() {
                             Ok(ControlAction::Continue) => {
-                                let recv = MultiRecv::new(this.ktls.fd(), this.bgid);
+                                let recv = MultiRecv::new(this.ktls.fd());
                                 this.state = State::Recving(recv);
                             }
                             Ok(ControlAction::End) => {

@@ -27,9 +27,12 @@ use std::time::Duration;
 
 use popple_tls::{Config, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+mod common;
+use common::MediumRing;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -92,7 +95,7 @@ impl EchoServer {
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
         let handle = thread::spawn(move || {
-            main_thread(async move {
+            main_thread_with::<MediumRing, _>(async move {
                 let cfg = make_config();
                 let mut acc = MultiAccept::new(port).expect("bind");
                 ready_tx.send(()).unwrap();
@@ -106,7 +109,7 @@ impl EchoServer {
                         else {
                             return;
                         };
-                        let mut stream = ktls.into_messages(BufGroup::Medium);
+                        let mut stream = ktls.into_messages::<MediumRing>();
                         while let Some(item) = stream.next().await {
                             let Ok(frame) = item else { break };
                             let data: &[u8] = frame.as_ref();

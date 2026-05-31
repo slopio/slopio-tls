@@ -4,9 +4,10 @@ use std::time::Duration;
 use popple_tls::{
     ServerName, client_config_dangerous_no_verification, connect, ktls_available,
 };
-use runtime::main_thread;
-use runtime::net::BufGroup;
+use runtime::main_thread_with;
 use runtime_streams::StreamExt;
+
+runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 fn main() {
     if !ktls_available() {
@@ -32,7 +33,7 @@ fn main() {
     let config = client_config_dangerous_no_verification(Some(&[b"http/1.1"]))
         .expect("client config");
 
-    main_thread(async move {
+    main_thread_with::<MediumRing, _>(async move {
         let server_name = ServerName::try_from(host.clone()).expect("server name");
         let ktls = match connect(addr, server_name, config, Duration::from_secs(10)).await {
             Ok(s) => s,
@@ -50,7 +51,7 @@ fn main() {
             "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: popple-tls/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n"
         );
 
-        let mut stream = ktls.into_messages(BufGroup::Medium);
+        let mut stream = ktls.into_messages::<MediumRing>();
         stream.send(req.into_bytes()).await.0.expect("send request");
 
         let mut total = 0usize;

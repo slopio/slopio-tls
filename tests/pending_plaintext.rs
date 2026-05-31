@@ -27,9 +27,12 @@ use popple_tls::{
     handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+mod common;
+use common::MediumRing;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -139,7 +142,7 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
     let (first_frame_tx, first_frame_rx) = mpsc::channel::<(bool, Vec<u8>)>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(server_port).unwrap();
             server_ready_tx.send(()).unwrap();
@@ -147,7 +150,7 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("server handshake");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let frame = stream.next().await.expect("frame").expect("frame ok");
             // Report which variant we got so the assertion proves the
             // coalesced-into-pending_plaintext path actually fired.
@@ -193,7 +196,7 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
     proxy_ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -204,7 +207,7 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
             )
             .await
             .expect("client connect");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             stream
                 .send(b"coalesced-with-finished")
                 .await

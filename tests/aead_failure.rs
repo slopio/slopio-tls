@@ -32,9 +32,12 @@ use popple_tls::{
     handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+mod common;
+use common::MediumRing;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -133,7 +136,7 @@ fn aead_corruption_triggers_fatal_alert() {
     let (server_err_tx, server_err_rx) = mpsc::channel::<std::io::Error>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(server_port).unwrap();
             server_ready_tx.send(()).unwrap();
@@ -141,7 +144,7 @@ fn aead_corruption_triggers_fatal_alert() {
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("server handshake");
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             stream.send(b"ready").await.0.expect("send ready");
             match stream.next().await {
                 Some(Err(e)) => server_err_tx.send(e).unwrap(),
@@ -194,7 +197,7 @@ fn aead_corruption_triggers_fatal_alert() {
     proxy_ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -206,7 +209,7 @@ fn aead_corruption_triggers_fatal_alert() {
             .await
             .expect("client connect");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let ready = stream
                 .next()
                 .await

@@ -3,9 +3,11 @@ use std::time::Duration;
 use popple_tls::{ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 const RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nhello via h1\n\n";
@@ -30,7 +32,7 @@ fn main() {
          -servername localhost -alpn http/1.1 -quiet </dev/null"
     );
 
-    main_thread(async move {
+    main_thread_with::<MediumRing, _>(async move {
         let mut acceptor = MultiAccept::new(9092).expect("bind 9092");
         while let Some(socket) = acceptor.next().await {
             let cfg = config.clone();
@@ -42,7 +44,7 @@ fn main() {
                         .unwrap_or_else(|| "<none>".to_string());
                     println!("handshake done, negotiated ALPN = {}", alpn);
 
-                    let mut stream = ktls.into_messages(BufGroup::Medium);
+                    let mut stream = ktls.into_messages::<MediumRing>();
                     let (result, _) = stream.send(RESPONSE).await;
                     if let Err(e) = result {
                         eprintln!("send: {}", e);

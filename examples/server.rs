@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, ktls_available, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn main() {
@@ -30,13 +32,13 @@ fn main() {
     println!("listening on 0.0.0.0:9091 (TLS 1.3, kTLS, KtlsMessages echo)");
     println!("test with: openssl s_client -connect 127.0.0.1:9091 -tls1_3 -servername localhost");
 
-    main_thread(async move {
+    main_thread_with::<MediumRing, _>(async move {
         let mut acceptor = MultiAccept::new(9091).expect("bind 9091");
         while let Some(socket) = acceptor.next().await {
             let cfg = config.clone();
             match handshake(socket, cfg, Duration::from_secs(10)).await {
                 Ok(ktls) => {
-                    let mut stream = ktls.into_messages(BufGroup::Medium);
+                    let mut stream = ktls.into_messages::<MediumRing>();
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(buf) => {

@@ -9,9 +9,12 @@ use popple_tls::{
     handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread;
-use runtime::net::{BufGroup, MultiAccept};
+use runtime::main_thread_with;
+use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+
+mod common;
+use common::MediumRing;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 static INIT: Once = Once::new();
@@ -69,7 +72,7 @@ fn client_and_server_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -78,7 +81,7 @@ fn client_and_server_round_trip() {
                 .await
                 .expect("server handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let first = stream.next().await.expect("frame").expect("frame ok");
             let data: &[u8] = first.as_ref();
             assert_eq!(data, b"ping");
@@ -89,7 +92,7 @@ fn client_and_server_round_trip() {
     ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -101,7 +104,7 @@ fn client_and_server_round_trip() {
             .await
             .expect("client connect");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             stream.send(b"ping").await.0.expect("send ping");
             let reply = stream.next().await.expect("reply").expect("reply ok");
             let data: &[u8] = reply.as_ref();
@@ -129,7 +132,7 @@ fn client_downloads_large_file_intact() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -138,7 +141,7 @@ fn client_downloads_large_file_intact() {
                 .await
                 .expect("server handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let payload = deterministic_payload(FILE_LEN, SEED);
             stream.send(payload).await.0.expect("send payload");
             // Drop stream → socket → TCP FIN. Client sees end-of-stream.
@@ -148,7 +151,7 @@ fn client_downloads_large_file_intact() {
     ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -160,7 +163,7 @@ fn client_downloads_large_file_intact() {
             .await
             .expect("client connect");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let mut received = Vec::with_capacity(FILE_LEN);
             while let Some(item) = stream.next().await {
                 let frame = item.expect("frame ok");
@@ -205,7 +208,7 @@ fn vectored_send_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -214,7 +217,7 @@ fn vectored_send_round_trip() {
                 .await
                 .expect("server handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let body = deterministic_payload(MID_LEN, SEED);
             let bufs: Vec<Vec<u8>> = vec![PREFIX.to_vec(), body, SUFFIX.to_vec()];
             stream.send_vectored(bufs).await.0.expect("send_vectored");
@@ -224,7 +227,7 @@ fn vectored_send_round_trip() {
     ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -236,7 +239,7 @@ fn vectored_send_round_trip() {
             .await
             .expect("client connect");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let mut received = Vec::with_capacity(MID_LEN + PREFIX.len() + SUFFIX.len());
             while let Some(item) = stream.next().await {
                 let frame = item.expect("frame ok");
@@ -282,7 +285,7 @@ fn server_initiated_key_update_round_trip() {
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
@@ -291,7 +294,7 @@ fn server_initiated_key_update_round_trip() {
                 .await
                 .expect("server handshake");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             stream.send(b"before").await.0.expect("send before");
             stream.initiate_key_update().expect("initiate_key_update");
             stream.send(b"after").await.0.expect("send after");
@@ -301,7 +304,7 @@ fn server_initiated_key_update_round_trip() {
     ready_rx.recv().unwrap();
 
     let client = thread::spawn(move || {
-        main_thread(async move {
+        main_thread_with::<MediumRing, _>(async move {
             let cfg = client_config_dangerous_no_verification(None).expect("client config");
             let server_name = ServerName::try_from("localhost").unwrap();
             let ktls = connect(
@@ -313,7 +316,7 @@ fn server_initiated_key_update_round_trip() {
             .await
             .expect("client connect");
 
-            let mut stream = ktls.into_messages(BufGroup::Medium);
+            let mut stream = ktls.into_messages::<MediumRing>();
             let mut received = Vec::new();
             while let Some(item) = stream.next().await {
                 let frame = item.expect("frame ok");
