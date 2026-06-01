@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#76b2708284638845e25d70b309840ea819a6ea77"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
 dependencies = [
  "slab",
  "smallvec",
@@ -163,7 +163,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#76b2708284638845e25d70b309840ea819a6ea77"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
 dependencies = [
  "io-uring",
  "rustix",
@@ -370,7 +370,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#76b2708284638845e25d70b309840ea819a6ea77"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
 dependencies = [
  "libc",
  "mimalloc",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#76b2708284638845e25d70b309840ea819a6ea77"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#76b2708284638845e25d70b309840ea819a6ea77"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
 
 [[package]]
 name = "rustix"
