@@ -191,10 +191,20 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
 
         if handshake_done {
             if filled == 0 {
-                break;
+                // Linux's TCP_ULP "tls" attach does not reprocess ciphertext
+                // already sitting in the TCP receive queue: the strparser
+                // initialized by set_crypto_info only sees data delivered via
+                // sk_data_ready after attach, and the queued skbs become
+                // unreachable. So we must drain the kernel queue here, feed
+                // it through rustls, and only break once FIONREAD shows zero.
+                if kernel_recv_pending(&socket) == 0 {
+                    break;
+                }
+                complete_one_record(&socket, &mut in_buf, &mut filled).await?;
+                continue;
             }
             if discard == 0 {
-                recv_more(&socket, &mut in_buf, &mut filled).await?;
+                complete_one_record(&socket, &mut in_buf, &mut filled).await?;
             }
         }
     }
@@ -205,6 +215,20 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     let (secrets, kernel_conn) = conn.into_kernel()?;
     KtlsSocket::establish(socket, secrets, kernel_conn, alpn, pending_plaintext)
         .map_err(HandshakeError::Io)
+}
+
+/// Bytes the kernel TCP receive queue currently holds, via `FIONREAD`. Called
+/// at handshake exit to detect ciphertext that would otherwise be lost when
+/// `TCP_ULP "tls"` is attached. Returns 0 if the ioctl fails — the worst case
+/// is that we break out one iteration early and the race remains, which is
+/// the pre-fix behavior.
+fn kernel_recv_pending(socket: &SocketWrapper) -> usize {
+    let mut n: libc::c_int = 0;
+    if unsafe { libc::ioctl(socket.fd, libc::FIONREAD, &mut n) } < 0 {
+        0
+    } else {
+        n as usize
+    }
 }
 
 fn shift(in_buf: &mut PooledBuf, filled: &mut usize, discard: usize) {
@@ -222,7 +246,54 @@ async fn recv_more(
     if *filled == RECORD_BUF {
         return Err(HandshakeError::LeftoverBytes);
     }
-    let scratch = PooledScratch::new(RECORD_BUF - *filled);
+    recv_into(socket, in_buf, filled, RECORD_BUF - *filled).await
+}
+
+/// Post-handshake record-aligned drain. Reads exactly enough bytes to finish
+/// the single TLS record at the head of `in_buf` — the 5-byte header tells us
+/// how many ciphertext bytes the record carries, and we stop there. The next
+/// records (if any) stay in the kernel TCP receive queue for the next drain
+/// iteration. Used in place of `recv_more` once `handshake_done` is true so
+/// each loop turn processes one well-bounded record instead of "whatever fits
+/// in the buffer", which keeps `pending_plaintext` growth predictable and the
+/// drain easy to instrument record by record.
+async fn complete_one_record(
+    socket: &SocketWrapper,
+    in_buf: &mut PooledBuf,
+    filled: &mut usize,
+) -> Result<(), HandshakeError> {
+    // 1. Make sure the 5-byte TLSCiphertext header is present.
+    while *filled < 5 {
+        recv_into(socket, in_buf, filled, 5 - *filled).await?;
+    }
+    // 2. TLSCiphertext.length is a big-endian uint16 at offset 3.
+    let len = u16::from_be_bytes([in_buf[3], in_buf[4]]) as usize;
+    let need_total = 5 + len;
+    if need_total > RECORD_BUF {
+        // The on-wire length field exceeds our buffer — either a malformed
+        // peer or a record we can't fit. rustls would also reject this, but
+        // surfacing it here avoids overruns in `recv_into`'s slice indexing.
+        return Err(HandshakeError::LeftoverBytes);
+    }
+    // 3. Top up the body, looping over short recvs.
+    while *filled < need_total {
+        recv_into(socket, in_buf, filled, need_total - *filled).await?;
+    }
+    Ok(())
+}
+
+/// Pull up to `cap` bytes from `socket` into `in_buf` starting at `filled`,
+/// advancing `filled` by what the kernel actually delivered. `cap` bounds the
+/// kernel's write via the scratch buffer's `bytes_total`, so we never overrun
+/// `in_buf`'s remaining room — the caller is responsible for sizing `cap`
+/// against `RECORD_BUF - *filled`.
+async fn recv_into(
+    socket: &SocketWrapper,
+    in_buf: &mut PooledBuf,
+    filled: &mut usize,
+    cap: usize,
+) -> Result<(), HandshakeError> {
+    let scratch = PooledScratch::new(cap);
     let (result, scratch) = socket_recv(socket, scratch).await;
     let n = result.map_err(HandshakeError::Io)?;
     if n == 0 {
