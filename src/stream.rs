@@ -146,6 +146,27 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         self.ktls.initiate_key_update()
     }
 
+    /// Bytes of plaintext decrypted in userspace during the handshake
+    /// (leftover-after-Finished) that haven't been yielded as `Frame::Owned`
+    /// yet. Non-zero only on the first poll after a peer that pipelined
+    /// application data with its `Finished` record.
+    pub fn pending_plaintext_len(&self) -> usize {
+        self.ktls.pending_plaintext.as_ref().map_or(0, |v| v.len())
+    }
+
+    /// `SSL_pending` equivalent: bytes the kernel reports as immediately
+    /// readable via `FIONREAD`. On a kTLS socket this is plaintext already
+    /// decrypted by the strparser and waiting to be pulled by `recv` — useful
+    /// to spot data dozing in the kernel between two `poll_next` calls.
+    pub fn recv_pending(&self) -> std::io::Result<usize> {
+        let mut n: libc::c_int = 0;
+        let r = unsafe { libc::ioctl(self.ktls.fd(), libc::FIONREAD, &mut n) };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
     /// Send the entire plaintext buffer over the kTLS socket, looping over
     /// short writes internally. The buffer is handed back alongside the result
     /// so the caller keeps their allocation regardless of success or failure.
@@ -171,10 +192,7 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     ///
     /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
     /// handed back alongside the result.
-    pub async fn send_vectored<B: IoBuf>(
-        &mut self,
-        bufs: Vec<B>,
-    ) -> (std::io::Result<()>, Vec<B>) {
+    pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
         let (result, bufs) = send_vectored_all(self.ktls.as_socket(), bufs).await;
         if result.is_ok() {
             let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
