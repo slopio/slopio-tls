@@ -107,6 +107,9 @@ impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
 pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
     ktls: KtlsSocket<S>,
     state: State<R>,
+    // TEMPORARY: instrumentation counters for diagnosing dropped-frames bug.
+    rx_total: u64,
+    tx_total: u64,
 }
 
 enum State<R: BufRingSpec> {
@@ -125,11 +128,31 @@ impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
     pub fn into_messages<R: BufRingSpec>(self) -> KtlsMessages<R, S> {
-        let recv = MultiRecv::new(self.fd());
+        let fd = self.fd();
+        let pp_len = self.pending_plaintext.as_ref().map_or(0, |v| v.len());
+        println!(
+            "[kTLS fd={fd}] into_messages: pending_plaintext={pp_len} kernel_pending={}",
+            kernel_recv_pending(fd)
+        );
+        let recv = MultiRecv::new(fd);
         KtlsMessages {
             ktls: self,
             state: State::Recving(recv),
+            rx_total: 0,
+            tx_total: 0,
         }
+    }
+}
+
+// TEMPORARY helper for the dropped-frames instrumentation. Returns the byte
+// count `FIONREAD` reports on the socket — on a kTLS socket this is plaintext
+// already decrypted by the kernel strparser and not yet pulled.
+fn kernel_recv_pending(fd: i32) -> usize {
+    let mut n: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) } < 0 {
+        0
+    } else {
+        n as usize
     }
 }
 
@@ -176,9 +199,16 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     /// `.to_vec()` at the boundary; callers with `&'static [u8]` /
     /// `&'static [u8; N]` can pass them directly (no allocation).
     pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
+        let n = buf.bytes_init();
+        let fd = self.ktls.fd();
         let (result, buf) = send_all(self.ktls.as_socket(), buf).await;
-        if result.is_ok() {
-            self.ktls.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
+        match &result {
+            Ok(()) => {
+                self.ktls.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
+                self.tx_total += n as u64;
+                println!("[kTLS fd={fd}] send len={n} tx_total={}", self.tx_total);
+            }
+            Err(e) => println!("[kTLS fd={fd}] send FAILED len={n} err={e}"),
         }
         (result, buf)
     }
@@ -193,10 +223,22 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
     /// handed back alongside the result.
     pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
+        let n: usize = bufs.iter().map(|b| b.bytes_init()).sum();
+        let nchunks = bufs.len();
+        let fd = self.ktls.fd();
         let (result, bufs) = send_vectored_all(self.ktls.as_socket(), bufs).await;
-        if result.is_ok() {
-            let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
-            self.ktls.tx_records += (total as u64).div_ceil(16384);
+        match &result {
+            Ok(()) => {
+                self.ktls.tx_records += (n as u64).div_ceil(16384);
+                self.tx_total += n as u64;
+                println!(
+                    "[kTLS fd={fd}] send_vectored len={n} chunks={nchunks} tx_total={}",
+                    self.tx_total
+                );
+            }
+            Err(e) => {
+                println!("[kTLS fd={fd}] send_vectored FAILED len={n} chunks={nchunks} err={e}")
+            }
         }
         (result, bufs)
     }
@@ -207,8 +249,16 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        let fd = this.ktls.fd();
 
         if let Some(buf) = this.ktls.pending_plaintext.take() {
+            let n = buf.len();
+            this.rx_total += n as u64;
+            println!(
+                "[kTLS fd={fd}] Frame::Owned len={n} rx_total={} kernel_pending={}",
+                this.rx_total,
+                kernel_recv_pending(fd)
+            );
             return Poll::Ready(Some(Ok(Frame::Owned(buf))));
         }
 
@@ -223,6 +273,7 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         let e = err
                             .take()
                             .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
+                        println!("[kTLS fd={fd}] fatal alert sent, surfacing err={e}");
                         this.state = State::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
@@ -230,23 +281,49 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                 State::Recving(recv) => match Pin::new(recv).poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
+                        println!(
+                            "[kTLS fd={fd}] stream end rx_total={} kernel_pending={}",
+                            this.rx_total,
+                            kernel_recv_pending(fd)
+                        );
                         this.state = State::Done;
                         return Poll::Ready(None);
                     }
                     Poll::Ready(Some(Ok(buf))) => {
+                        let n = buf.len();
+                        this.rx_total += n as u64;
+                        println!(
+                            "[kTLS fd={fd}] Frame::Borrowed bid={} len={n} rx_total={} kernel_pending={}",
+                            buf.bid(),
+                            this.rx_total,
+                            kernel_recv_pending(fd)
+                        );
                         return Poll::Ready(Some(Ok(Frame::Borrowed(buf))));
                     }
                     Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
+                        println!(
+                            "[kTLS fd={fd}] EIO (control record) rx_total={} kernel_pending={}",
+                            this.rx_total,
+                            kernel_recv_pending(fd)
+                        );
                         match this.ktls.handle_control_record() {
                             Ok(ControlAction::Continue) => {
+                                println!("[kTLS fd={fd}] control: Continue (KeyUpdate/NST)");
                                 let recv = MultiRecv::new(this.ktls.fd());
                                 this.state = State::Recving(recv);
                             }
                             Ok(ControlAction::End) => {
+                                println!(
+                                    "[kTLS fd={fd}] control: End (peer alert / EOF) rx_total={}",
+                                    this.rx_total
+                                );
                                 this.state = State::Done;
                                 return Poll::Ready(None);
                             }
                             Ok(ControlAction::SendFatal { payload, err }) => {
+                                println!(
+                                    "[kTLS fd={fd}] control: SendFatal payload={payload:?} err={err}"
+                                );
                                 let send = socket_send_control_record(
                                     this.ktls.as_socket(),
                                     TLS_RECORD_TYPE_ALERT,
@@ -258,6 +335,7 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                                 };
                             }
                             Err(e) => {
+                                println!("[kTLS fd={fd}] control: handle_control_record err={e}");
                                 this.state = State::Done;
                                 return Poll::Ready(Some(Err(e)));
                             }
@@ -269,6 +347,10 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         // AEAD verification failure: the kernel discarded a
                         // record we couldn't decrypt. Notify the peer with
                         // a `bad_record_mac` fatal alert (RFC 8446 §6).
+                        println!(
+                            "[kTLS fd={fd}] EBADMSG (AEAD failure) rx_total={}",
+                            this.rx_total
+                        );
                         let send = socket_send_control_record(
                             this.ktls.as_socket(),
                             TLS_RECORD_TYPE_ALERT,
@@ -280,6 +362,7 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         };
                     }
                     Poll::Ready(Some(Err(e))) => {
+                        println!("[kTLS fd={fd}] recv err={e:?} rx_total={}", this.rx_total);
                         this.state = State::Done;
                         return Poll::Ready(Some(Err(completion_to_io(e))));
                     }
