@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#493c5a3281d05f0b815365eccccfc7f203a70f59"
 dependencies = [
  "slab",
  "smallvec",
@@ -52,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "bumpalo"
@@ -163,7 +163,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#493c5a3281d05f0b815365eccccfc7f203a70f59"
 dependencies = [
  "io-uring",
  "rustix",
@@ -203,9 +203,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "mimalloc"
@@ -370,7 +370,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#493c5a3281d05f0b815365eccccfc7f203a70f59"
 dependencies = [
  "libc",
  "mimalloc",
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#493c5a3281d05f0b815365eccccfc7f203a70f59"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#c62e605b5abc84a67e4b74f7da0ea1e47c249169"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#493c5a3281d05f0b815365eccccfc7f203a70f59"
 
 [[package]]
 name = "rustix"
@@ -667,18 +667,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.50"
+version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b065d4f0e55f82fae73202e189638116a87c55ab6b8e6c2721e13dd9d854ad1"
+checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.50"
+version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b631b19d36a892ab55420c92dbc83ccd79274f25be714855d3074aa71cab639"
+checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
 dependencies = [
  "proc-macro2",
  "quote",
