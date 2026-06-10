@@ -5,7 +5,7 @@ use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
     BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, PooledBuf, WriteControlRecord, send_all,
-    socket_send_control_record, socket_write_fixed_zc,
+    socket_send_control_record, socket_write_fixed, socket_write_fixed_zc,
 };
 use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
@@ -189,6 +189,19 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     /// [`send`]: Self::send
     pub async fn send_fixed_zc(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
         let (result, buf) = socket_write_fixed_zc(self.ktls.as_socket(), buf).await;
+        if result.is_ok() {
+            self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
+        }
+        (result, buf)
+    }
+
+    /// Send a registered (fixed) buffer over the kTLS socket without the
+    /// zero-copy `SEND_ZC` path. The buffer still avoids the fixed-buffer
+    /// registration cost; the kernel copies it into its send buffers as usual.
+    ///
+    /// The buffer is handed back alongside the result for cancel-safety.
+    pub async fn send_fixed(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        let (result, buf) = socket_write_fixed(self.ktls.as_socket(), buf).await;
         if result.is_ok() {
             self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
         }
