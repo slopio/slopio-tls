@@ -71,7 +71,7 @@ impl<S> KtlsSocket<S> {
         Ok(())
     }
 
-    pub(crate) fn establish(
+    pub(crate) fn switch_to_ktls(
         socket: SocketWrapper,
         secrets: ExtractedSecrets,
         kernel_conn: KernelConnection<S>,
@@ -94,8 +94,8 @@ impl<S> KtlsSocket<S> {
         let (tx_seq, tx_secret) = secrets.tx;
         let (rx_seq, rx_secret) = secrets.rx;
         unsafe {
-            set_crypto_info(socket.fd, TLS_TX, tx_seq, &tx_secret)?;
             set_crypto_info(socket.fd, TLS_RX, rx_seq, &rx_secret)?;
+            set_crypto_info(socket.fd, TLS_TX, tx_seq, &tx_secret)?;
         }
         Ok(KtlsSocket {
             socket,
@@ -117,8 +117,7 @@ impl<S> KtlsSocket<S> {
                     err: std::io::Error::other("truncated handshake message"),
                 });
             }
-            let body_len =
-                u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
+            let body_len = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
             if 4 + body_len > payload.len() {
                 return Err(ControlAction::SendFatal {
                     payload: &FATAL_DECODE_ERROR,
@@ -148,13 +147,12 @@ impl<S> KtlsSocket<S> {
                             });
                         }
                     };
-                    let (seq, secret) =
-                        self.kernel_conn.update_rx_secret().map_err(|e| {
-                            ControlAction::SendFatal {
-                                payload: &FATAL_DECODE_ERROR,
-                                err: std::io::Error::other(format!("update_rx_secret: {e:?}")),
-                            }
-                        })?;
+                    let (seq, secret) = self.kernel_conn.update_rx_secret().map_err(|e| {
+                        ControlAction::SendFatal {
+                            payload: &FATAL_DECODE_ERROR,
+                            err: std::io::Error::other(format!("update_rx_secret: {e:?}")),
+                        }
+                    })?;
                     unsafe {
                         set_crypto_info(self.socket.fd, TLS_RX, seq, &secret).map_err(|e| {
                             ControlAction::SendFatal {
@@ -164,12 +162,11 @@ impl<S> KtlsSocket<S> {
                         })?;
                     }
                     if request_update {
-                        self.initiate_key_update().map_err(|e| {
-                            ControlAction::SendFatal {
+                        self.initiate_key_update()
+                            .map_err(|e| ControlAction::SendFatal {
                                 payload: &FATAL_DECODE_ERROR,
                                 err: e,
-                            }
-                        })?;
+                            })?;
                     }
                 }
                 HANDSHAKE_NEW_SESSION_TICKET => {
@@ -181,9 +178,7 @@ impl<S> KtlsSocket<S> {
                 _ => {
                     return Err(ControlAction::SendFatal {
                         payload: &FATAL_UNEXPECTED_MESSAGE,
-                        err: std::io::Error::other(
-                            "unexpected post-handshake handshake message",
-                        ),
+                        err: std::io::Error::other("unexpected post-handshake handshake message"),
                     });
                 }
             }

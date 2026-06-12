@@ -213,7 +213,7 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         .negotiated_alpn()
         .and_then(|neg| alpn_protocols.iter().copied().find(|p| *p == neg));
     let (secrets, kernel_conn) = conn.into_kernel()?;
-    KtlsSocket::establish(socket, secrets, kernel_conn, alpn, pending_plaintext)
+    KtlsSocket::switch_to_ktls(socket, secrets, kernel_conn, alpn, pending_plaintext)
         .map_err(HandshakeError::Io)
 }
 
