@@ -69,6 +69,11 @@ pub fn server_config(settings: ServerSettings) -> Result<Config, rustls::Error> 
         .with_no_client_auth()
         .with_single_cert(settings.certs, settings.key)?;
     cfg.enable_secret_extraction = true;
+    // No session resumption: we configure no real ticketer/store (rustls would
+    // otherwise fall back to an in-memory, single-process, restart-volatile
+    // cache), and sending tickets only adds post-handshake round-trips that
+    // delay the kTLS switch. Disable them entirely.
+    cfg.send_tls13_tickets = 0;
     let alpn_protocols: &'static [&'static [u8]] = match settings.alpn_protocols {
         Some(list) if list.is_empty() => {
             return Err(rustls::Error::General(
