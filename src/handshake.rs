@@ -190,35 +190,26 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         shift(&mut in_buf, &mut filled, discard);
 
         if handshake_done {
-            // Linux's TCP_ULP "tls" attach does not reprocess ciphertext
-            // already sitting in the TCP receive queue: the strparser
-            // initialized by set_crypto_info only sees data delivered via
-            // sk_data_ready *after* attach, so any queued skbs become
-            // unreachable. We must therefore drain the queue here and feed it
-            // through rustls before switching. One bulk `recv` grabs whatever
-            // is queued; rustls slices it into records on the next `step`. We
-            // may only attach once `in_buf` sits on a record boundary
-            // (filled == 0) AND the queue is empty.
-            match drain_available(&socket, &mut in_buf, &mut filled)? {
-                // Got bytes: loop so rustls consumes the complete records.
-                DrainStep::Read => {}
-                DrainStep::Empty => {
-                    if filled == 0 {
-                        break; // record-aligned + queue drained → attach kTLS
-                    }
-                    // A record is split in transit: its head is buffered but
-                    // the tail hasn't arrived. Await the rest (won't be
-                    // EAGAIN) so we land back on a boundary before attaching —
-                    // we cannot hand a half-read record to kTLS.
-                    recv_more(&socket, &mut in_buf, &mut filled).await?;
-                }
-                DrainStep::Eof => {
-                    if filled == 0 {
-                        break; // clean close on a boundary: nothing to drain
-                    }
-                    return Err(HandshakeError::PeerClosed); // truncated record
-                }
+            // EXPERIMENT: drain logic disabled. Instead of draining the kernel
+            // receive queue before attaching kTLS, we let rustls process
+            // whatever was already in `in_buf` (→ pending_plaintext), then just
+            // probe with FIONREAD. If anything is still pending — leftover in
+            // our buffer, or bytes in the kernel queue — we abort, so we can
+            // observe how often data is actually waiting at handshake end.
+            // Revert to `drain_available` afterward.
+            if discard > 0 {
+                // rustls just consumed a record; loop to process the next one.
+                continue;
             }
+            let mut pending: libc::c_int = 0;
+            let queued =
+                unsafe { libc::ioctl(socket.fd, libc::FIONREAD, &mut pending) } == 0 && pending > 0;
+            if filled > 0 || queued {
+                return Err(HandshakeError::UnexpectedState(
+                    "data pending after handshake (drain disabled for test)",
+                ));
+            }
+            break;
         }
     }
 
@@ -234,6 +225,7 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
 /// drain. `Read` = bytes landed in `in_buf` (let rustls slice them into
 /// records); `Empty` = the kernel queue is momentarily empty (`EAGAIN`);
 /// `Eof` = the peer closed cleanly.
+#[allow(dead_code)] // kept while the drain is disabled for the experiment
 enum DrainStep {
     Read,
     Empty,
@@ -246,6 +238,7 @@ enum DrainStep {
 /// rustls does the record framing on the following `step`, so this needn't
 /// know record lengths. `MSG_DONTWAIT` keeps it non-blocking independent of
 /// the socket's `O_NONBLOCK` flag; `EINTR` retries.
+#[allow(dead_code)] // disabled while the FIONREAD-abort experiment is in place
 fn drain_available(
     socket: &SocketWrapper,
     in_buf: &mut PooledBuf,
