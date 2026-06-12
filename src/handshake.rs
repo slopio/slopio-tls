@@ -190,22 +190,34 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         shift(&mut in_buf, &mut filled, discard);
 
         if handshake_done {
-            if filled == 0 {
-                // Linux's TCP_ULP "tls" attach does not reprocess ciphertext
-                // already sitting in the TCP receive queue: the strparser
-                // initialized by set_crypto_info only sees data delivered via
-                // sk_data_ready after attach, and the queued skbs become
-                // unreachable. So we must drain the kernel queue here, feed
-                // it through rustls, and only break once a non-blocking recv
-                // reports the queue is empty (EAGAIN) at a record boundary.
-                if !drain_boundary(&socket, &mut in_buf, &mut filled)? {
-                    break;
+            // Linux's TCP_ULP "tls" attach does not reprocess ciphertext
+            // already sitting in the TCP receive queue: the strparser
+            // initialized by set_crypto_info only sees data delivered via
+            // sk_data_ready *after* attach, so any queued skbs become
+            // unreachable. We must therefore drain the queue here and feed it
+            // through rustls before switching. One bulk `recv` grabs whatever
+            // is queued; rustls slices it into records on the next `step`. We
+            // may only attach once `in_buf` sits on a record boundary
+            // (filled == 0) AND the queue is empty.
+            match drain_available(&socket, &mut in_buf, &mut filled)? {
+                // Got bytes: loop so rustls consumes the complete records.
+                DrainStep::Read => {}
+                DrainStep::Empty => {
+                    if filled == 0 {
+                        break; // record-aligned + queue drained → attach kTLS
+                    }
+                    // A record is split in transit: its head is buffered but
+                    // the tail hasn't arrived. Await the rest (won't be
+                    // EAGAIN) so we land back on a boundary before attaching —
+                    // we cannot hand a half-read record to kTLS.
+                    recv_more(&socket, &mut in_buf, &mut filled).await?;
                 }
-                complete_one_record(&socket, &mut in_buf, &mut filled).await?;
-                continue;
-            }
-            if discard == 0 {
-                complete_one_record(&socket, &mut in_buf, &mut filled).await?;
+                DrainStep::Eof => {
+                    if filled == 0 {
+                        break; // clean close on a boundary: nothing to drain
+                    }
+                    return Err(HandshakeError::PeerClosed); // truncated record
+                }
             }
         }
     }
@@ -218,21 +230,33 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         .map_err(HandshakeError::Io)
 }
 
-/// Probe the kernel TCP receive queue at a record boundary (`filled == 0`)
-/// with a single non-blocking `recv`, replacing the old `FIONREAD` ioctl.
-/// At a boundary `in_buf` holds no partial record, so `EAGAIN` — or a clean
-/// EOF — means the queue is fully drained and it is safe to attach kTLS:
-/// returns `Ok(false)`. Otherwise it pulls up to the 5-byte record header
-/// into `in_buf` (leaving the body and any following records in the kernel
-/// for `complete_one_record` to read one at a time) and returns `Ok(true)`.
-/// `MSG_DONTWAIT` makes the non-blocking behavior explicit rather than
-/// relying on the accepted socket's `O_NONBLOCK` flag.
-fn drain_boundary(
+/// Outcome of a single non-blocking bulk `recv` during the post-handshake
+/// drain. `Read` = bytes landed in `in_buf` (let rustls slice them into
+/// records); `Empty` = the kernel queue is momentarily empty (`EAGAIN`);
+/// `Eof` = the peer closed cleanly.
+enum DrainStep {
+    Read,
+    Empty,
+    Eof,
+}
+
+/// One synchronous bulk recv straight into `in_buf`, pulling everything the
+/// kernel currently has queued (up to the buffer's remaining room) in a
+/// single syscall — no io_uring round-trip, no `PooledScratch`, no copy.
+/// rustls does the record framing on the following `step`, so this needn't
+/// know record lengths. `MSG_DONTWAIT` keeps it non-blocking independent of
+/// the socket's `O_NONBLOCK` flag; `EINTR` retries.
+fn drain_available(
     socket: &SocketWrapper,
     in_buf: &mut PooledBuf,
     filled: &mut usize,
-) -> Result<bool, HandshakeError> {
-    let dst = &mut in_buf[..5];
+) -> Result<DrainStep, HandshakeError> {
+    if *filled == RECORD_BUF {
+        // Buffer full yet rustls consumed nothing on the last step: a record
+        // larger than the buffer, which rustls would reject anyway.
+        return Err(HandshakeError::LeftoverBytes);
+    }
+    let dst = &mut in_buf[*filled..RECORD_BUF];
     let n = loop {
         let r = unsafe {
             libc::recv(
@@ -246,19 +270,17 @@ fn drain_boundary(
             let err = std::io::Error::last_os_error();
             match err.kind() {
                 std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => return Ok(false),
+                std::io::ErrorKind::WouldBlock => return Ok(DrainStep::Empty),
                 _ => return Err(HandshakeError::Io(err)),
             }
         }
         break r as usize;
     };
-    // n == 0 is a clean peer close: nothing left to drain, attach and let the
-    // post-handshake read path surface the EOF.
     if n == 0 {
-        return Ok(false);
+        return Ok(DrainStep::Eof);
     }
     *filled += n;
-    Ok(true)
+    Ok(DrainStep::Read)
 }
 
 fn shift(in_buf: &mut PooledBuf, filled: &mut usize, discard: usize) {
@@ -277,81 +299,6 @@ async fn recv_more(
         return Err(HandshakeError::LeftoverBytes);
     }
     recv_into(socket, in_buf, filled, RECORD_BUF - *filled).await
-}
-
-/// Post-handshake record-aligned drain. Reads exactly enough bytes to finish
-/// the single TLS record at the head of `in_buf` — the 5-byte header tells us
-/// how many ciphertext bytes the record carries, and we stop there. The next
-/// records (if any) stay in the kernel TCP receive queue for the next drain
-/// iteration. Used in place of `recv_more` once `handshake_done` is true so
-/// each loop turn processes one well-bounded record instead of "whatever fits
-/// in the buffer", which keeps `pending_plaintext` growth predictable and the
-/// drain easy to instrument record by record.
-async fn complete_one_record(
-    socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
-    filled: &mut usize,
-) -> Result<(), HandshakeError> {
-    // 1. Make sure the 5-byte TLSCiphertext header is present.
-    while *filled < 5 {
-        recv_one(socket, in_buf, filled, 5 - *filled).await?;
-    }
-    // 2. TLSCiphertext.length is a big-endian uint16 at offset 3.
-    let len = u16::from_be_bytes([in_buf[3], in_buf[4]]) as usize;
-    let need_total = 5 + len;
-    if need_total > RECORD_BUF {
-        // The on-wire length field exceeds our buffer — either a malformed
-        // peer or a record we can't fit. rustls would also reject this, but
-        // surfacing it here avoids overruns in `recv_one`'s slice indexing.
-        return Err(HandshakeError::LeftoverBytes);
-    }
-    // 3. Top up the body, looping over short recvs.
-    while *filled < need_total {
-        recv_one(socket, in_buf, filled, need_total - *filled).await?;
-    }
-    Ok(())
-}
-
-/// Pull the next chunk of the record being drained. The accepted socket is
-/// `O_NONBLOCK`, so we first try a plain synchronous `recv` straight into
-/// `in_buf`: when the bytes are already queued (the common case at drain
-/// time — FIONREAD just reported them) this skips the io_uring round-trip,
-/// the `PooledScratch` allocation, and the scratch→`in_buf` copy entirely.
-/// Only if the kernel queue is momentarily empty (`EAGAIN` — the rest of the
-/// record is still in flight) do we fall back to the async `recv_into`, which
-/// awaits readiness without parking the worker thread.
-async fn recv_one(
-    socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
-    filled: &mut usize,
-    cap: usize,
-) -> Result<(), HandshakeError> {
-    let dst = &mut in_buf[*filled..*filled + cap];
-    let r = loop {
-        let r = unsafe {
-            libc::recv(
-                socket.fd,
-                dst.as_mut_ptr() as *mut libc::c_void,
-                dst.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                // Nothing queued right now: await the rest via io_uring.
-                std::io::ErrorKind::WouldBlock => return recv_into(socket, in_buf, filled, cap).await,
-                _ => return Err(HandshakeError::Io(err)),
-            }
-        }
-        break r as usize;
-    };
-    if r == 0 {
-        return Err(HandshakeError::PeerClosed);
-    }
-    *filled += r;
-    Ok(())
 }
 
 /// Pull up to `cap` bytes from `socket` into `in_buf` starting at `filled`,
