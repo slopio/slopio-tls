@@ -232,6 +232,88 @@ fn premise_multiple_records_queued() {
 }
 
 #[test]
+fn premise_record_queued_between_ulp_and_rx_key() {
+    // The attach is two syscalls: setsockopt(TCP_ULP,"tls") then
+    // set_crypto_info(TLS_RX). What happens to a record that lands in the
+    // queue *between* them — ULP attached but no RX key yet? This is the
+    // window the live h2spec failures point at.
+    let (mut a, mut b) = tcp_pair();
+    attach_ulp(a.as_raw_fd()).unwrap();
+    set_tls(a.as_raw_fd(), TLS_TX, 0).unwrap();
+
+    attach_ulp(b.as_raw_fd()).expect("ulp B"); // ULP on, no RX key yet
+    a.write_all(b"between-ulp-and-key").unwrap();
+    thread::sleep(Duration::from_millis(50)); // record lands in B's queue
+    let rx = set_tls(b.as_raw_fd(), TLS_RX, 0); // now arm RX
+    eprintln!("[ulpwin]   set_crypto_info(RX) after data queued -> {rx:?}");
+    rx.expect("TLS_RX");
+
+    let res = read_decrypted(&mut b, 19);
+    eprintln!("\n=========== VERDICT (ULP→key window) ===========");
+    match &res {
+        Ok(v) if v == b"between-ulp-and-key" => {
+            eprintln!("RECOVERED — record queued in the ULP→key window survives.")
+        }
+        Ok(v) => eprintln!("MISMATCH ({} bytes) -> BUG: {:?}", v.len(), v),
+        Err(e) => eprintln!(
+            "read failed: {e} -> THIS is the bug: a record landing after TCP_ULP\n\
+             but before the RX key is LOST. That's the h2spec settings-lost case."
+        ),
+    }
+    eprintln!("================================================\n");
+    assert_eq!(
+        res.unwrap_or_default(),
+        b"between-ulp-and-key",
+        "record queued between TCP_ULP and TLS_RX setup was lost"
+    );
+}
+
+#[test]
+fn premise_queued_record_at_nonzero_seq() {
+    // The HTTP/2 bug shape: the first app record (magic, seq 0) was decrypted
+    // in software during the handshake drain, so rustls hands kTLS rx_seq = 1.
+    // The NEXT record (settings, seq 1) is already sitting in the queue when we
+    // attach RX at rec_seq = 1. Does the kernel apply the non-zero starting seq
+    // to the ALREADY-QUEUED record, or does it (mis)count queued data from 0?
+    let (mut a, mut b) = tcp_pair();
+    attach_ulp(a.as_raw_fd()).unwrap();
+    set_tls(a.as_raw_fd(), TLS_TX, 1).unwrap(); // TX emits this record as seq 1
+
+    a.write_all(b"settings-at-seq-one").unwrap();
+    let queued = wait_until_queue_stable(b.as_raw_fd());
+    eprintln!("[nzseq]    {queued} bytes (record seq 1) queued before RX attach");
+
+    attach_ulp(b.as_raw_fd()).expect("ulp B");
+    let rx = set_tls(b.as_raw_fd(), TLS_RX, 1); // RX starts at rec_seq 1
+    eprintln!("[nzseq]    set_crypto_info(RX, seq=1) -> {rx:?}");
+    rx.expect("TLS_RX seq 1");
+
+    let res = read_decrypted(&mut b, 19);
+    eprintln!("\n================= VERDICT (non-zero seq) =================");
+    match &res {
+        Ok(v) if v == b"settings-at-seq-one" => eprintln!(
+            "RECOVERED — kTLS applies rec_seq=1 to the queued record. Not the bug."
+        ),
+        Ok(v) => eprintln!(
+            "MISMATCH ({} bytes) -> THIS is the bug: queued data at non-zero seq is\n\
+             mishandled. {:?}",
+            v.len(),
+            v
+        ),
+        Err(e) => eprintln!(
+            "read failed: {e} -> THIS is the bug: a record queued at attach with a\n\
+             non-zero rec_seq is NOT decrypted (the HTTP/2 settings-lost case)."
+        ),
+    }
+    eprintln!("=========================================================\n");
+    assert_eq!(
+        res.unwrap_or_default(),
+        b"settings-at-seq-one",
+        "queued record at non-zero rec_seq was not recovered"
+    );
+}
+
+#[test]
 fn premise_record_fragmented_across_attach() {
     // Raw bytes of one record (seq 0), captured via the kernel's own encrypt.
     let cipher = capture_record(b"fragmented-record-xyz");
