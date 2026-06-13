@@ -69,10 +69,6 @@ impl From<std::io::Error> for HandshakeError {
     }
 }
 
-/// Abstracts the two `UnbufferedXxxConnection` types so the handshake loop is
-/// written once. rustls's `process_tls_records` is split into side-specific
-/// inherent impls — only the early-data handling differs — so a trait is the
-/// cheapest way to dedupe without forking the loop body.
 pub(crate) trait UnbufferedDriver: Sized {
     type Data;
     fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
@@ -190,26 +186,31 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         shift(&mut in_buf, &mut filled, discard);
 
         if handshake_done {
-            // EXPERIMENT: drain logic disabled. Instead of draining the kernel
-            // receive queue before attaching kTLS, we let rustls process
-            // whatever was already in `in_buf` (→ pending_plaintext), then just
-            // probe with FIONREAD. If anything is still pending — leftover in
-            // our buffer, or bytes in the kernel queue — we abort, so we can
-            // observe how often data is actually waiting at handshake end.
-            // Revert to `drain_available` afterward.
+            // kTLS RX reprocesses ciphertext already sitting in the TCP receive
+            // queue at attach time — verified on this kernel by the
+            // `ktls_queue_premise` integration test (complete records, multiple
+            // queued records with seq continuity, and a record fragmented across
+            // the attach are all recovered). So we do NOT drain the kernel queue:
+            // once we sit on a record boundary we attach and let the kernel
+            // decrypt whatever is queued or arrives later.
+            //
+            // The only thing kTLS can't pick up is a record head we already
+            // pulled into `in_buf` during the handshake recv — those bytes are
+            // out of the kernel's reach, so attaching there would start the
+            // strparser mid-record. We finish just that one record in software
+            // first; everything else is the kernel's job.
             if discard > 0 {
-                // rustls just consumed a record; loop to process the next one.
+                // rustls consumed a record this step; loop so it can slice the
+                // next complete one out of `in_buf` into `pending_plaintext`.
                 continue;
             }
-            let mut pending: libc::c_int = 0;
-            let queued =
-                unsafe { libc::ioctl(socket.fd, libc::FIONREAD, &mut pending) } == 0 && pending > 0;
-            if filled > 0 || queued {
-                return Err(HandshakeError::UnexpectedState(
-                    "data pending after handshake (drain disabled for test)",
-                ));
+            if filled == 0 {
+                break; // record-aligned, nothing held back → attach kTLS
             }
-            break;
+            // discard == 0 && filled > 0: a partial record head is buffered.
+            // Read its tail so rustls can decrypt it, then we re-align (the loop
+            // re-steps, consumes it, and breaks on the next `filled == 0`).
+            recv_more(&socket, &mut in_buf, &mut filled).await?;
         }
     }
 
@@ -219,61 +220,6 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     let (secrets, kernel_conn) = conn.into_kernel()?;
     KtlsSocket::switch_to_ktls(socket, secrets, kernel_conn, alpn, pending_plaintext)
         .map_err(HandshakeError::Io)
-}
-
-/// Outcome of a single non-blocking bulk `recv` during the post-handshake
-/// drain. `Read` = bytes landed in `in_buf` (let rustls slice them into
-/// records); `Empty` = the kernel queue is momentarily empty (`EAGAIN`);
-/// `Eof` = the peer closed cleanly.
-#[allow(dead_code)] // kept while the drain is disabled for the experiment
-enum DrainStep {
-    Read,
-    Empty,
-    Eof,
-}
-
-/// One synchronous bulk recv straight into `in_buf`, pulling everything the
-/// kernel currently has queued (up to the buffer's remaining room) in a
-/// single syscall — no io_uring round-trip, no `PooledScratch`, no copy.
-/// rustls does the record framing on the following `step`, so this needn't
-/// know record lengths. `MSG_DONTWAIT` keeps it non-blocking independent of
-/// the socket's `O_NONBLOCK` flag; `EINTR` retries.
-#[allow(dead_code)] // disabled while the FIONREAD-abort experiment is in place
-fn drain_available(
-    socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
-    filled: &mut usize,
-) -> Result<DrainStep, HandshakeError> {
-    if *filled == RECORD_BUF {
-        // Buffer full yet rustls consumed nothing on the last step: a record
-        // larger than the buffer, which rustls would reject anyway.
-        return Err(HandshakeError::LeftoverBytes);
-    }
-    let dst = &mut in_buf[*filled..RECORD_BUF];
-    let n = loop {
-        let r = unsafe {
-            libc::recv(
-                socket.fd,
-                dst.as_mut_ptr() as *mut libc::c_void,
-                dst.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => return Ok(DrainStep::Empty),
-                _ => return Err(HandshakeError::Io(err)),
-            }
-        }
-        break r as usize;
-    };
-    if n == 0 {
-        return Ok(DrainStep::Eof);
-    }
-    *filled += n;
-    Ok(DrainStep::Read)
 }
 
 fn shift(in_buf: &mut PooledBuf, filled: &mut usize, discard: usize) {
