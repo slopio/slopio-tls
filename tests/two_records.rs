@@ -108,10 +108,8 @@ fn two_separate_records_both_delivered() {
             .expect("client connect")
             .into_messages::<MediumRing>();
 
-            // Let the server finish attaching kTLS before any app data, so
-            // these arrive cleanly on the post-handshake read path.
-            Sleep::during(Duration::from_millis(100)).await;
-            // Record #1: the magic.
+            // Record #1: the magic, sent immediately (arrives around the
+            // server's handshake/attach boundary).
             ktls.send(MAGIC).await.0.expect("send magic");
             // Force the SETTINGS into a separate TLS record *and* a separate
             // TCP segment so the server sees two distinct records.

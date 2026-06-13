@@ -213,11 +213,6 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
                 .await
                 .0
                 .expect("send");
-            // Stay alive briefly instead of vanishing the instant the send
-            // returns: the proxy otherwise `shutdown(Both)`s the server socket
-            // before it finishes attaching kTLS, which a real client (awaiting
-            // a response, or half-closing) never does.
-            runtime::runtime::time::Sleep::during(std::time::Duration::from_millis(200)).await;
         });
     });
 

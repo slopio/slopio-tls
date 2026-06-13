@@ -124,7 +124,12 @@ enum State<R: BufRingSpec> {
 impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
-    pub fn into_messages<R: BufRingSpec>(self) -> KtlsMessages<R, S> {
+    pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
+        // Drain anything already queued in the kernel into `pending_plaintext`
+        // *before* arming the multishot recv: it drops records that are queued
+        // at arm time on a non-zero-RX-seq kTLS socket. See
+        // `KtlsSocket::drain_queued_records`.
+        self.drain_queued_records();
         let recv = MultiRecv::new(self.fd());
         KtlsMessages {
             ktls: self,

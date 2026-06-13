@@ -269,6 +269,74 @@ impl<S> KtlsSocket<S> {
             }),
         }
     }
+
+    /// Synchronously drain every TLS record already queued in the kernel right
+    /// after attach: application data into `pending_plaintext`, control records
+    /// dispatched inline. Uses non-blocking `recvmsg`, stopping the instant the
+    /// queue is empty (`EAGAIN`) — no timing involved.
+    ///
+    /// This is the deterministic replacement for a pre-attach grace-drain. The
+    /// io_uring multishot recv (`MultiRecv`) drops application-data records that
+    /// are already queued when it first arms on a kTLS socket whose RX sequence
+    /// is non-zero (which happens whenever the handshake software-decrypted a
+    /// pipelined record). Emptying the queue here means the multishot only ever
+    /// arms on an idle socket, where its post-arm delivery is reliable. The
+    /// blocking-`recvmsg` path used here has no such issue (verified by the
+    /// `ktls_queue_premise` tests). Call immediately before arming the recv.
+    pub(crate) fn drain_queued_records(&mut self) {
+        loop {
+            let mut payload = PooledBuf::new();
+            let mut iov = libc::iovec {
+                iov_base: payload.as_mut_ptr() as *mut libc::c_void,
+                iov_len: payload.len(),
+            };
+            let mut cmsg = TlsCmsg {
+                hdr: unsafe { std::mem::zeroed() },
+                record_type: 0,
+            };
+            cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
+            cmsg.hdr.cmsg_level = SOL_TLS;
+            cmsg.hdr.cmsg_type = TLS_GET_RECORD_TYPE;
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
+            msg.msg_controllen = size_of::<TlsCmsg>() as _;
+
+            let n = unsafe { libc::recvmsg(self.socket.fd, &mut msg, libc::MSG_DONTWAIT) };
+            if n < 0 {
+                // EAGAIN/EWOULDBLOCK: queue drained — done. EINTR: retry. Any
+                // other error: stop; it resurfaces on the real read path.
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if n == 0 {
+                return; // EOF
+            }
+            let n = n as usize;
+            match cmsg.record_type {
+                TLS_RECORD_TYPE_APPLICATION_DATA => {
+                    self.pending_plaintext
+                        .get_or_insert_with(Vec::new)
+                        .extend_from_slice(&payload[..n]);
+                }
+                TLS_RECORD_TYPE_HANDSHAKE => {
+                    // KeyUpdate (rekey RX inline) / NewSessionTicket (dropped).
+                    // On a protocol violation, stop draining; the read path
+                    // surfaces the error on the next poll.
+                    if self.process_handshake_messages(&payload[..n]).is_err() {
+                        return;
+                    }
+                }
+                // Alert (close_notify or fatal) or anything unexpected: stop.
+                // The multishot then observes the resulting EOF and ends the
+                // stream after `pending_plaintext` is delivered.
+                _ => return,
+            }
+        }
+    }
 }
 
 const SOL_TLS: libc::c_int = 282;
@@ -278,6 +346,7 @@ const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 pub(crate) const TLS_RECORD_TYPE_ALERT: u8 = 21;
 const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
+const TLS_RECORD_TYPE_APPLICATION_DATA: u8 = 23;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
 const TLS_1_3_VERSION: u16 = 0x0304;

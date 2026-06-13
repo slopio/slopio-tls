@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use runtime::net::{IoBuf, SocketWrapper, send_all as runtime_send_all, socket_recv};
-use runtime::runtime::time::{Sleep, timeout};
+use runtime::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::kernel::KernelConnection;
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
@@ -186,32 +186,24 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         shift(&mut in_buf, &mut filled, discard);
 
         if handshake_done {
-            // We must drain every record that has already reached the peer's
-            // first post-handshake flight into `pending_plaintext` (software)
-            // BEFORE attaching kTLS. The kernel itself *would* reprocess queued
-            // ciphertext after attach (see the `ktls_queue_premise` test, which
-            // confirms it via blocking reads) — but the io_uring **multishot
-            // recv** we use for reads (`MultiRecv`) drops records that are
-            // queued at the instant it first arms. h2spec reproduces this: with
-            // the magic alone in `pending_plaintext` (rx_seq=1) and the client
-            // SETTINGS left for the kTLS read path, the SETTINGS is silently
-            // lost ~40% of the time. Pulling it through rustls here (rx_seq
-            // advances, plaintext lands in `pending_plaintext`) sidesteps the
-            // multishot path entirely and makes h2spec deterministic.
+            // Records already pipelined into `in_buf` during the handshake recv
+            // are sliced out into `pending_plaintext` here, in software. Records
+            // still in the kernel queue are NOT drained here — they're handled
+            // after attach by `KtlsSocket::drain_queued_records` (a non-blocking
+            // recvmsg loop), which is the deterministic replacement for the old
+            // pre-attach grace-drain.
             if discard > 0 {
                 // rustls consumed a record this step; loop so it can slice the
                 // next complete one out of `in_buf` into `pending_plaintext`.
                 continue;
             }
-            // rustls can't progress on what's buffered. Poll the kernel queue
-            // (with a short grace for a pipelined flight still in flight): pull
-            // anything that's there through rustls, attach only once it's idle
-            // and we sit on a clean record boundary.
-            match drain_more(&socket, &mut in_buf, &mut filled).await? {
-                DrainMore::Got => continue,
-                DrainMore::Idle if filled == 0 => break,
-                DrainMore::Idle => return Err(HandshakeError::LeftoverBytes),
+            if filled == 0 {
+                break; // record-aligned → attach
             }
+            // discard == 0 && filled > 0: a partial record head sits in `in_buf`
+            // (out of the kernel's reach). Finish it in software so we attach on
+            // a clean boundary; the loop re-steps and breaks on `filled == 0`.
+            recv_more(&socket, &mut in_buf, &mut filled).await?;
         }
     }
 
@@ -221,51 +213,6 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     let (secrets, kernel_conn) = conn.into_kernel()?;
     KtlsSocket::switch_to_ktls(socket, secrets, kernel_conn, alpn, pending_plaintext)
         .map_err(HandshakeError::Io)
-}
-
-const DRAIN_GRACE: Duration = Duration::from_millis(2);
-const DRAIN_POLL: Duration = Duration::from_micros(200);
-
-/// Bytes the kernel TCP receive queue holds right now (`FIONREAD`). A failed
-/// ioctl — e.g. `ENOTCONN` once the peer has closed — is reported as `0`: there
-/// is simply nothing more to drain, which lets the caller attach and surface
-/// the close on the read path instead of failing the handshake.
-fn kernel_recv_pending(socket: &SocketWrapper) -> usize {
-    let mut pending: libc::c_int = 0;
-    if unsafe { libc::ioctl(socket.fd, libc::FIONREAD, &mut pending) } != 0 {
-        return 0;
-    }
-    pending.max(0) as usize
-}
-
-enum DrainMore {
-    Got,
-    Idle,
-}
-
-async fn drain_more(
-    socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
-    filled: &mut usize,
-) -> Result<DrainMore, HandshakeError> {
-    let mut waited = Duration::ZERO;
-    loop {
-        if kernel_recv_pending(socket) > 0 {
-            // Best-effort: if the read fails because the peer closed/reset
-            // mid-drain, there is nothing more to pull — stop and attach with
-            // what we already moved into `pending_plaintext`. The real read
-            // path surfaces the close.
-            return match recv_more(socket, in_buf, filled).await {
-                Ok(()) => Ok(DrainMore::Got),
-                Err(_) => Ok(DrainMore::Idle),
-            };
-        }
-        if waited >= DRAIN_GRACE {
-            return Ok(DrainMore::Idle);
-        }
-        Sleep::during(DRAIN_POLL).await;
-        waited += DRAIN_POLL;
-    }
 }
 
 fn shift(in_buf: &mut PooledBuf, filled: &mut usize, discard: usize) {
