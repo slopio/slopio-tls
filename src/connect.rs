@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use runtime::net::connect_tcp;
+use runtime::net::{SocketWrapper, connect_tcp};
 use runtime::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
@@ -38,6 +38,21 @@ pub async fn connect(
     deadline: Duration,
 ) -> Result<KtlsSocket<ClientConnectionData>, HandshakeError> {
     let socket = connect_tcp(addr).await?;
+    handshake_client(socket, server_name, config, deadline).await
+}
+
+/// Drive a TLS client handshake over an already-connected socket.
+///
+/// Like [`connect`], but takes a `SocketWrapper` the caller has already
+/// established (TCP connected) instead of dialing the address itself. kTLS
+/// attach requires a connected socket, so the peer's TCP handshake must be
+/// complete before calling this.
+pub async fn handshake_client(
+    socket: SocketWrapper,
+    server_name: ServerName<'static>,
+    config: ClientConfig,
+    deadline: Duration,
+) -> Result<KtlsSocket<ClientConnectionData>, HandshakeError> {
     let ClientConfig {
         rustls,
         alpn_protocols,

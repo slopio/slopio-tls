@@ -10,7 +10,7 @@ pub use config::{
     ClientConfig, ClientSettings, Config, ServerSettings, client_config,
     client_config_dangerous_no_verification, server_config,
 };
-pub use connect::connect;
+pub use connect::{connect, handshake_client};
 pub use handshake::{HandshakeError, handshake};
 pub use ktls::KtlsSocket;
 pub use probe::ktls_available;
