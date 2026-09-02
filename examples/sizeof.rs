@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::os::fd::FromRawFd;
 use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, server_config};
@@ -26,7 +27,9 @@ fn main() {
     })
     .unwrap();
 
-    let dummy_sock = SocketWrapper { fd: -1 };
+    // SAFETY: -1 is not an open descriptor; the wrapper is only used to
+    // measure the handshake future's size and is dropped without any I/O.
+    let dummy_sock = unsafe { SocketWrapper::from_raw_fd(-1) };
     let f_handshake = handshake(dummy_sock, cfg.clone(), Duration::from_secs(1));
     println!("handshake future: {} B", fsize(f_handshake));
 

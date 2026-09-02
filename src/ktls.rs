@@ -1,4 +1,4 @@
-use runtime::net::SocketWrapper;
+use runtime::net::{OwnedReadHalf, OwnedWriteHalf, SocketWrapper};
 use rustls::kernel::KernelConnection;
 use rustls::server::ServerConnectionData;
 use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
@@ -6,7 +6,12 @@ use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
 use crate::pool::PooledBuf;
 
 pub struct KtlsSocket<S = ServerConnectionData> {
-    socket: SocketWrapper,
+    /// Write half of the connection. Also the handle we use for the fd
+    /// (sync `recvmsg`/`setsockopt` and async sends).
+    socket: OwnedWriteHalf,
+    /// Read half, `Some` until `into_messages` hands it to the `MultiRecv`,
+    /// which owns it for as long as the multishot recv is armed.
+    pub(crate) read_half: Option<OwnedReadHalf>,
     pub(crate) kernel_conn: KernelConnection<S>,
     pub(crate) alpn: Option<&'static [u8]>,
     pub(crate) pending_plaintext: Option<Vec<u8>>,
@@ -37,11 +42,11 @@ pub(crate) enum ControlAction {
 
 impl<S> KtlsSocket<S> {
     pub fn fd(&self) -> i32 {
-        self.socket.fd
+        self.socket.socket().fd()
     }
 
     pub fn as_socket(&self) -> &SocketWrapper {
-        &self.socket
+        self.socket.socket()
     }
 
     pub fn alpn(&self) -> Option<&'static [u8]> {
@@ -55,7 +60,7 @@ impl<S> KtlsSocket<S> {
     pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
         unsafe {
             send_control_record(
-                self.socket.fd,
+                self.fd(),
                 TLS_RECORD_TYPE_HANDSHAKE,
                 &KEY_UPDATE_NOT_REQUESTED,
             )?;
@@ -65,7 +70,7 @@ impl<S> KtlsSocket<S> {
             .update_tx_secret()
             .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
         unsafe {
-            set_crypto_info(self.socket.fd, TLS_TX, seq, &secret)?;
+            set_crypto_info(self.fd(), TLS_TX, seq, &secret)?;
         }
         self.tx_records = 0;
         Ok(())
@@ -79,9 +84,10 @@ impl<S> KtlsSocket<S> {
         pending_plaintext: Option<Vec<u8>>,
     ) -> std::io::Result<Self> {
         let ulp = b"tls";
+        let fd = socket.fd();
         let ret = unsafe {
             libc::setsockopt(
-                socket.fd,
+                fd,
                 libc::SOL_TCP,
                 libc::TCP_ULP,
                 ulp.as_ptr() as *const libc::c_void,
@@ -94,11 +100,13 @@ impl<S> KtlsSocket<S> {
         let (tx_seq, tx_secret) = secrets.tx;
         let (rx_seq, rx_secret) = secrets.rx;
         unsafe {
-            set_crypto_info(socket.fd, TLS_RX, rx_seq, &rx_secret)?;
-            set_crypto_info(socket.fd, TLS_TX, tx_seq, &tx_secret)?;
+            set_crypto_info(fd, TLS_RX, rx_seq, &rx_secret)?;
+            set_crypto_info(fd, TLS_TX, tx_seq, &tx_secret)?;
         }
+        let (read_half, socket) = socket.into_split();
         Ok(KtlsSocket {
             socket,
+            read_half: Some(read_half),
             kernel_conn,
             alpn,
             pending_plaintext,
@@ -154,7 +162,7 @@ impl<S> KtlsSocket<S> {
                         }
                     })?;
                     unsafe {
-                        set_crypto_info(self.socket.fd, TLS_RX, seq, &secret).map_err(|e| {
+                        set_crypto_info(self.fd(), TLS_RX, seq, &secret).map_err(|e| {
                             ControlAction::SendFatal {
                                 payload: &FATAL_DECODE_ERROR,
                                 err: e,
@@ -212,7 +220,7 @@ impl<S> KtlsSocket<S> {
         msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
         msg.msg_controllen = size_of::<TlsCmsg>() as _;
 
-        let n = unsafe { libc::recvmsg(self.socket.fd, &mut msg, 0) };
+        let n = unsafe { libc::recvmsg(self.fd(), &mut msg, 0) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -303,7 +311,7 @@ impl<S> KtlsSocket<S> {
             msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
             msg.msg_controllen = size_of::<TlsCmsg>() as _;
 
-            let n = unsafe { libc::recvmsg(self.socket.fd, &mut msg, libc::MSG_DONTWAIT) };
+            let n = unsafe { libc::recvmsg(self.fd(), &mut msg, libc::MSG_DONTWAIT) };
             if n < 0 {
                 // EAGAIN/EWOULDBLOCK: queue drained — done. EINTR: retry. Any
                 // other error: stop; it resurfaces on the real read path.

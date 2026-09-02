@@ -4,8 +4,8 @@ use std::task::{Context, Poll};
 use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
-    BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, PooledBuf, WriteControlRecord, send_all,
-    socket_send_control_record, socket_write_fixed, socket_write_fixed_zc,
+    BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, PooledBuf, WriteControlRecord,
+    send_all, socket_send_control_record, socket_write_fixed, socket_write_fixed_zc,
 };
 use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
@@ -110,7 +110,9 @@ pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
 }
 
 enum State<R: BufRingSpec> {
-    Recving(MultiRecv<R>),
+    /// The multishot recv owns the socket's read half while armed; the write
+    /// half stays in `KtlsMessages::ktls` for sends and control records.
+    Recving(MultiRecv<R, OwnedReadHalf>),
     /// A fatal alert is being sent over kTLS in response to a protocol
     /// violation we detected on the recv side. Once the send completes the
     /// stream transitions to `Done` and surfaces `err` to the caller.
@@ -130,7 +132,11 @@ impl<S> KtlsSocket<S> {
         // at arm time on a non-zero-RX-seq kTLS socket. See
         // `KtlsSocket::drain_queued_records`.
         self.drain_queued_records();
-        let recv = MultiRecv::new(self.fd());
+        let read_half = self
+            .read_half
+            .take()
+            .expect("read half is only taken by into_messages");
+        let recv = MultiRecv::new(read_half);
         KtlsMessages {
             ktls: self,
             state: State::Recving(recv),
@@ -214,6 +220,20 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     }
 }
 
+impl<R: BufRingSpec, S> KtlsMessages<R, S> {
+    /// Replace a multishot recv that terminated (the kernel ends it on any
+    /// error CQE, e.g. the EIO that signals a control record) with a fresh
+    /// one on the same read half. The driver never resubmits a terminated
+    /// op by itself, and `MultiRecv` owns the read half, so we have to take
+    /// the old stream out of `state` to get the half back.
+    fn rearm_recv(&mut self) {
+        let State::Recving(old) = std::mem::replace(&mut self.state, State::Done) else {
+            unreachable!("rearm_recv is only called from the Recving arm")
+        };
+        self.state = State::Recving(MultiRecv::new(old.into_inner()));
+    }
+}
+
 impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
     type Item = std::io::Result<Frame<R>>;
 
@@ -250,10 +270,7 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                     }
                     Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
                         match this.ktls.handle_control_record() {
-                            Ok(ControlAction::Continue) => {
-                                let recv = MultiRecv::new(this.ktls.fd());
-                                this.state = State::Recving(recv);
-                            }
+                            Ok(ControlAction::Continue) => this.rearm_recv(),
                             Ok(ControlAction::End) => {
                                 this.state = State::Done;
                                 return Poll::Ready(None);

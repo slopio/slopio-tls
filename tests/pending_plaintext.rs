@@ -140,6 +140,13 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
     let (server_ready_tx, server_ready_rx) = mpsc::channel::<()>();
     let (proxy_ready_tx, proxy_ready_rx) = mpsc::channel::<()>();
     let (first_frame_tx, first_frame_rx) = mpsc::channel::<(bool, Vec<u8>)>();
+    // Keeps the client connection open until the server has yielded its
+    // first frame. Otherwise the client's drop-after-send races the server:
+    // the proxy relays the FIN, the server socket lands in CLOSE_WAIT while
+    // it is still processing the coalesced Finished + app-data, and the
+    // kTLS attach (`setsockopt(TCP_ULP)`) fails with ENOTCONN because the
+    // kernel only accepts the TLS ULP on an ESTABLISHED socket.
+    let (client_release_tx, client_release_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {
         main_thread_with::<MediumRing, _>(async move {
@@ -213,10 +220,15 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
                 .await
                 .0
                 .expect("send");
+            // Block until the server has reported its frame. The client has
+            // nothing else to drive, so blocking the runtime thread is fine.
+            let _ = client_release_rx.recv();
+            drop(stream);
         });
     });
 
     let (is_owned, first) = first_frame_rx.recv().expect("server should report a frame");
+    let _ = client_release_tx.send(());
     assert!(
         is_owned,
         "expected Frame::Owned (pending_plaintext leftover path), \
