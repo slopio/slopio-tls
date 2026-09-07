@@ -14,8 +14,55 @@ pub struct KtlsSocket<S = ServerConnectionData> {
     pub(crate) read_half: Option<OwnedReadHalf>,
     pub(crate) kernel_conn: KernelConnection<S>,
     pub(crate) alpn: Option<&'static [u8]>,
-    pub(crate) pending_plaintext: Option<Vec<u8>>,
+    /// What the software handshake left for the stream. Taken by
+    /// `into_messages`, which extends it with the kernel-queue drain.
+    pub(crate) prelude: Prelude,
     pub(crate) tx_records: u64,
+}
+
+/// Everything the receive side saw *before* a recv could be armed, as a
+/// value. Two phases produce one: the software handshake (records rustls
+/// decrypted after Finished) and the post-attach kernel-queue drain. Since
+/// those phases consume any close_notify or protocol violation they meet,
+/// the resulting `action` is the only record of it. `into_messages` picks
+/// the stream constructor from it: `KtlsMessages::open` on `Continue`,
+/// `KtlsMessages::closed` on `End`, and the fatal-alert path on `SendFatal`.
+#[derive(Debug)]
+pub(crate) struct Prelude {
+    /// Application data decrypted before any recv existed. Yielded as the
+    /// first frame (`Frame::Owned`).
+    pub plaintext: Option<Vec<u8>>,
+    /// How the receive side stands after that data: `Continue` (arm a
+    /// recv), `End` (peer closed) or `SendFatal` (violation to report).
+    pub action: ControlAction,
+}
+
+impl Prelude {
+    /// Session still open after `plaintext`.
+    pub fn open(plaintext: Option<Vec<u8>>) -> Self {
+        Self {
+            plaintext,
+            action: ControlAction::Continue,
+        }
+    }
+
+    /// Peer sent close_notify (or EOF) after `plaintext`.
+    pub fn closed(plaintext: Option<Vec<u8>>) -> Self {
+        Self {
+            plaintext,
+            action: ControlAction::End,
+        }
+    }
+
+    pub fn peer_closed(&self) -> bool {
+        matches!(self.action, ControlAction::End)
+    }
+}
+
+impl Default for Prelude {
+    fn default() -> Self {
+        Self::open(None)
+    }
 }
 
 /// Result of inspecting a control record delivered via the kTLS recvmsg cmsg
@@ -57,6 +104,15 @@ impl<S> KtlsSocket<S> {
         self.tx_records
     }
 
+    /// `true` if the peer already ended the session during the handshake
+    /// (close_notify pipelined behind Finished). No more application data
+    /// will arrive; anything received before the close is still delivered by
+    /// `into_messages`, which then yields `None`. Sending remains possible,
+    /// e.g. to answer a pipelined request.
+    pub fn peer_closed(&self) -> bool {
+        self.prelude.peer_closed()
+    }
+
     pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
         unsafe {
             send_control_record(
@@ -81,7 +137,7 @@ impl<S> KtlsSocket<S> {
         secrets: ExtractedSecrets,
         kernel_conn: KernelConnection<S>,
         alpn: Option<&'static [u8]>,
-        pending_plaintext: Option<Vec<u8>>,
+        prelude: Prelude,
     ) -> std::io::Result<Self> {
         let ulp = b"tls";
         let fd = socket.fd();
@@ -109,7 +165,7 @@ impl<S> KtlsSocket<S> {
             read_half: Some(read_half),
             kernel_conn,
             alpn,
-            pending_plaintext,
+            prelude,
             tx_records: 0,
         })
     }
@@ -195,16 +251,13 @@ impl<S> KtlsSocket<S> {
         Ok(())
     }
 
-    /// Read the control record the kernel is holding (signalled by an EIO
-    /// completion on the recv ring) and decide how the stream should react.
-    /// This function performs the sync recvmsg and any RX rekey (KeyUpdate)
-    /// inline, but never sends an alert itself — alert emission is async and
-    /// driven by the caller's state machine.
-    pub(crate) fn handle_control_record(&mut self) -> std::io::Result<ControlAction> {
-        let mut payload = PooledBuf::new();
+    /// One `recvmsg` into `buf` with a record-type cmsg attached. Returns
+    /// `(record_type, len)`; `record_type` is 0 when the kernel attached no
+    /// cmsg, which only happens on TCP EOF (`len == 0`).
+    fn recv_record(&self, buf: &mut PooledBuf, flags: libc::c_int) -> std::io::Result<(u8, usize)> {
         let mut iov = libc::iovec {
-            iov_base: payload.as_mut_ptr() as *mut libc::c_void,
-            iov_len: payload.len(),
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
         };
         let mut cmsg = TlsCmsg {
             hdr: unsafe { std::mem::zeroed() },
@@ -220,68 +273,79 @@ impl<S> KtlsSocket<S> {
         msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
         msg.msg_controllen = size_of::<TlsCmsg>() as _;
 
-        let n = unsafe { libc::recvmsg(self.fd(), &mut msg, 0) };
+        let n = unsafe { libc::recvmsg(self.fd(), &mut msg, flags) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let n = n as usize;
+        Ok((cmsg.record_type, n as usize))
+    }
 
-        // `n == 0` is ambiguous: it can be a TCP EOF (no cmsg attached) or a
-        // zero-byte control-record payload (cmsg present, e.g. a malformed
-        // empty alert). We let the match dispatch handle both correctly:
-        // ALERT/HANDSHAKE arms validate length and emit the right fatal
-        // alert; the catch-all treats `n == 0` with no cmsg as End.
-        match cmsg.record_type {
+    /// How the stream reacts to one non-application-data record, as
+    /// delivered by [`recv_record`](Self::recv_record). Performs any RX rekey
+    /// (KeyUpdate) inline, but never sends an alert itself — alert emission
+    /// is async and driven by the stream's state machine.
+    ///
+    /// A zero-length payload is ambiguous: TCP EOF (no cmsg, type 0) or a
+    /// zero-byte control record (cmsg present, e.g. a malformed empty
+    /// alert). The arms below tell them apart by record type.
+    fn control_action(&mut self, record_type: u8, payload: &[u8]) -> ControlAction {
+        match record_type {
             TLS_RECORD_TYPE_HANDSHAKE => {
                 // RFC 8446 §4: every post-handshake message starts with
                 // HandshakeType(1) || uint24 length || body. A single record
                 // can carry multiple messages back-to-back (rustls servers
                 // coalesce all four default NewSessionTickets into one
-                // record), so we loop until the record is consumed.
+                // record), so the parser loops until the record is consumed.
                 //
-                // We accept two message types here:
+                // Accepted here:
                 //   - KeyUpdate (24): rekey RX, optionally TX.
-                //   - NewSessionTicket (4): silently discard. We don't
-                //     implement resumption yet, and the server sends these
-                //     by default in TLS 1.3.
+                //   - NewSessionTicket (4): silently discarded. We don't
+                //     implement resumption yet, and servers send these by
+                //     default in TLS 1.3.
                 // Anything else is unexpected_message; malformed framing is
                 // decode_error.
-                if let Err(action) = self.process_handshake_messages(&payload[..n]) {
-                    return Ok(action);
+                match self.process_handshake_messages(payload) {
+                    Ok(()) => ControlAction::Continue,
+                    Err(action) => action,
                 }
-                Ok(ControlAction::Continue)
             }
-            TLS_RECORD_TYPE_ALERT => {
-                // Per RFC 8446 §6, alert records carry exactly 2 bytes
-                // (level + description); shorter is malformed → decode_error.
-                if n < 2 {
-                    return Ok(ControlAction::SendFatal {
-                        payload: &FATAL_DECODE_ERROR,
-                        err: std::io::Error::other("truncated alert record"),
-                    });
-                }
-                // Any peer alert ends the stream. TLS 1.3 treats every alert
-                // except close_notify/user_canceled as fatal anyway; we
-                // simply stop receiving and let the caller surface `None`.
-                Ok(ControlAction::End)
-            }
-            0 if n == 0 => {
-                // No cmsg, no bytes — TCP EOF on a connection where kTLS
-                // had signalled a control record waiting but the peer
-                // disappeared before recvmsg could pull it.
-                Ok(ControlAction::End)
-            }
-            _ => Ok(ControlAction::SendFatal {
+            // Per RFC 8446 §6, alert records carry exactly 2 bytes
+            // (level + description); shorter is malformed → decode_error.
+            TLS_RECORD_TYPE_ALERT if payload.len() < 2 => ControlAction::SendFatal {
+                payload: &FATAL_DECODE_ERROR,
+                err: std::io::Error::other("truncated alert record"),
+            },
+            // Any peer alert ends the stream. TLS 1.3 treats every alert
+            // except close_notify/user_canceled as fatal anyway; we simply
+            // stop receiving and let the caller surface `None`.
+            TLS_RECORD_TYPE_ALERT => ControlAction::End,
+            // No cmsg, no bytes: TCP EOF.
+            0 if payload.is_empty() => ControlAction::End,
+            _ => ControlAction::SendFatal {
                 payload: &FATAL_UNEXPECTED_MESSAGE,
                 err: std::io::Error::other("unexpected TLS record type"),
-            }),
+            },
         }
     }
 
+    /// Read the control record the kernel is holding (signalled by an EIO
+    /// completion on the recv ring) and decide how the stream should react.
+    /// The record is already decrypted and parked on the socket's rx list,
+    /// so the blocking `recvmsg` returns immediately.
+    pub(crate) fn handle_control_record(&mut self) -> std::io::Result<ControlAction> {
+        let mut buf = PooledBuf::new();
+        let (record_type, n) = self.recv_record(&mut buf, 0)?;
+        Ok(self.control_action(record_type, &buf[..n]))
+    }
+
     /// Synchronously drain every TLS record already queued in the kernel right
-    /// after attach: application data into `pending_plaintext`, control records
-    /// dispatched inline. Uses non-blocking `recvmsg`, stopping the instant the
-    /// queue is empty (`EAGAIN`) — no timing involved.
+    /// after attach, extending `prelude`: application data is appended to its
+    /// plaintext, control records are dispatched through
+    /// [`control_action`](Self::control_action), and the first non-`Continue`
+    /// action ends the drain and becomes the prelude's action. Uses
+    /// non-blocking `recvmsg`, stopping the instant the queue is empty
+    /// (`EAGAIN`) — no timing involved. A prelude that is already closed is
+    /// returned untouched.
     ///
     /// This is the deterministic replacement for a pre-attach grace-drain. The
     /// io_uring multishot recv (`MultiRecv`) drops application-data records that
@@ -291,59 +355,40 @@ impl<S> KtlsSocket<S> {
     /// arms on an idle socket, where its post-arm delivery is reliable. The
     /// blocking-`recvmsg` path used here has no such issue (verified by the
     /// `ktls_queue_premise` tests). Call immediately before arming the recv.
-    pub(crate) fn drain_queued_records(&mut self) {
-        loop {
-            let mut payload = PooledBuf::new();
-            let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr() as *mut libc::c_void,
-                iov_len: payload.len(),
-            };
-            let mut cmsg = TlsCmsg {
-                hdr: unsafe { std::mem::zeroed() },
-                record_type: 0,
-            };
-            cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
-            cmsg.hdr.cmsg_level = SOL_TLS;
-            cmsg.hdr.cmsg_type = TLS_GET_RECORD_TYPE;
-            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
-            msg.msg_controllen = size_of::<TlsCmsg>() as _;
-
-            let n = unsafe { libc::recvmsg(self.fd(), &mut msg, libc::MSG_DONTWAIT) };
-            if n < 0 {
-                // EAGAIN/EWOULDBLOCK: queue drained — done. EINTR: retry. Any
-                // other error: stop; it resurfaces on the real read path.
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return;
-            }
-            if n == 0 {
-                return; // EOF
-            }
-            let n = n as usize;
-            match cmsg.record_type {
-                TLS_RECORD_TYPE_APPLICATION_DATA => {
-                    self.pending_plaintext
-                        .get_or_insert_with(Vec::new)
-                        .extend_from_slice(&payload[..n]);
-                }
-                TLS_RECORD_TYPE_HANDSHAKE => {
-                    // KeyUpdate (rekey RX inline) / NewSessionTicket (dropped).
-                    // On a protocol violation, stop draining; the read path
-                    // surfaces the error on the next poll.
-                    if self.process_handshake_messages(&payload[..n]).is_err() {
-                        return;
-                    }
-                }
-                // Alert (close_notify or fatal) or anything unexpected: stop.
-                // The multishot then observes the resulting EOF and ends the
-                // stream after `pending_plaintext` is delivered.
-                _ => return,
-            }
+    ///
+    /// Because this consumes any close_notify or violation it meets, the
+    /// returned action is the only trace of it: a recv armed afterwards would
+    /// never see the alert and would wait for a TCP FIN that a half-closed
+    /// peer may never send.
+    pub(crate) fn drain_queued_records(&mut self, prelude: Prelude) -> Prelude {
+        let Prelude {
+            mut plaintext,
+            action,
+        } = prelude;
+        if !matches!(action, ControlAction::Continue) {
+            return Prelude { plaintext, action };
         }
+        let mut buf = PooledBuf::new();
+        let action = loop {
+            let (record_type, n) = match self.recv_record(&mut buf, libc::MSG_DONTWAIT) {
+                Ok(rec) => rec,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // EAGAIN/EWOULDBLOCK: queue drained. Any other error resurfaces
+                // on the real read path once the recv is armed.
+                Err(_) => break ControlAction::Continue,
+            };
+            if record_type == TLS_RECORD_TYPE_APPLICATION_DATA {
+                plaintext
+                    .get_or_insert_with(Vec::new)
+                    .extend_from_slice(&buf[..n]);
+                continue;
+            }
+            match self.control_action(record_type, &buf[..n]) {
+                ControlAction::Continue => continue, // KeyUpdate / NewSessionTicket handled
+                action => break action,
+            }
+        };
+        Prelude { plaintext, action }
     }
 }
 

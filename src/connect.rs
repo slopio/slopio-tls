@@ -24,6 +24,9 @@ impl UnbufferedDriver for UnbufferedClientConnection {
     fn negotiated_alpn(&self) -> Option<&[u8]> {
         self.alpn_protocol()
     }
+    fn handshake_complete(&self) -> bool {
+        !rustls::CommonState::is_handshaking(self)
+    }
     fn into_kernel(
         self,
     ) -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error> {

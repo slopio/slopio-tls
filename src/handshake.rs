@@ -8,7 +8,7 @@ use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use crate::config::Config;
-use crate::ktls::KtlsSocket;
+use crate::ktls::{KtlsSocket, Prelude};
 use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf, PooledScratch};
 
 #[derive(Debug)]
@@ -73,6 +73,11 @@ pub(crate) trait UnbufferedDriver: Sized {
     type Data;
     fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
     fn negotiated_alpn(&self) -> Option<&[u8]>;
+    /// `true` once rustls considers the handshake finished, i.e. secrets can
+    /// be extracted. Distinct from having *observed* a traffic state: a
+    /// close_notify pipelined right behind Finished completes the handshake
+    /// and reports `PeerClosed` in the same step.
+    fn handshake_complete(&self) -> bool;
     fn into_kernel(self)
     -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error>;
 }
@@ -84,6 +89,12 @@ impl UnbufferedDriver for UnbufferedServerConnection {
     }
     fn negotiated_alpn(&self) -> Option<&[u8]> {
         self.alpn_protocol()
+    }
+    fn handshake_complete(&self) -> bool {
+        // Fully qualified: an unqualified `self.is_handshaking()` would
+        // resolve to nothing at this level and is easy to confuse with a
+        // trait method; the inherent one lives on `CommonState` via Deref.
+        !rustls::CommonState::is_handshaking(self)
     }
     fn into_kernel(
         self,
@@ -119,7 +130,10 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     let mut pending_plaintext: Option<Vec<u8>> = None;
     let mut handshake_done = false;
 
-    loop {
+    // The loop's value is what the software phase leaves for the stream:
+    // records rustls decrypted after Finished, and whether the peer had
+    // already closed by the time we attach.
+    let prelude = loop {
         let UnbufferedStatus { discard, state } = conn.step(&mut in_buf[..filled]);
 
         let s = match state {
@@ -175,7 +189,13 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
                 handshake_done = true;
             }
             ConnectionState::PeerClosed | ConnectionState::Closed => {
-                return Err(HandshakeError::PeerClosed);
+                // The peer sent close_notify. Whether that is an error depends
+                // on whether the handshake had already completed, which we
+                // can only ask rustls once `s` (borrowing `conn`) is gone —
+                // see the check after the loop. Records rustls already
+                // decrypted (a request pipelined between Finished and the
+                // alert) travel with the prelude either way.
+                break Prelude::closed(pending_plaintext.take());
             }
             ConnectionState::ReadEarlyData(_) => {
                 return Err(HandshakeError::UnexpectedState("ReadEarlyData (0-RTT)"));
@@ -198,20 +218,30 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
                 continue;
             }
             if filled == 0 {
-                break; // record-aligned → attach
+                // record-aligned → attach
+                break Prelude::open(pending_plaintext.take());
             }
             // discard == 0 && filled > 0: a partial record head sits in `in_buf`
             // (out of the kernel's reach). Finish it in software so we attach on
             // a clean boundary; the loop re-steps and breaks on `filled == 0`.
             recv_more(&socket, &mut in_buf, &mut filled).await?;
         }
+    };
+
+    if prelude.peer_closed() && !conn.handshake_complete() {
+        // close_notify mid-handshake: the peer gave up, nothing to attach.
+        return Err(HandshakeError::PeerClosed);
     }
+    // close_notify *after* a complete handshake is a valid, finished session:
+    // attach as usual so TX works (the pipelined request may need a reply)
+    // and the prelude's plaintext is delivered, then the stream ends. The
+    // kernel never sees the alert, so the prelude is the only record of it.
 
     let alpn = conn
         .negotiated_alpn()
         .and_then(|neg| alpn_protocols.iter().copied().find(|p| *p == neg));
     let (secrets, kernel_conn) = conn.into_kernel()?;
-    KtlsSocket::switch_to_ktls(socket, secrets, kernel_conn, alpn, pending_plaintext)
+    KtlsSocket::switch_to_ktls(socket, secrets, kernel_conn, alpn, prelude)
         .map_err(HandshakeError::Io)
 }
 

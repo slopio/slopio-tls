@@ -10,7 +10,9 @@ use runtime::net::{
 use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
 
-use crate::ktls::{ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, TLS_RECORD_TYPE_ALERT};
+use crate::ktls::{
+    ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, Prelude, TLS_RECORD_TYPE_ALERT,
+};
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
 ///
@@ -106,6 +108,9 @@ impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
 /// implemented because the application-level fix above is strictly better.
 pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
     ktls: KtlsSocket<S>,
+    /// Plaintext decrypted before the recv was armed (see `Prelude`).
+    /// Yielded as the first frame, ahead of whatever `state` says.
+    pending: Option<Vec<u8>>,
     state: State<R>,
 }
 
@@ -127,20 +132,99 @@ impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
     pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
-        // Drain anything already queued in the kernel into `pending_plaintext`
-        // *before* arming the multishot recv: it drops records that are queued
-        // at arm time on a non-zero-RX-seq kTLS socket. See
+        // Extend what the handshake left with anything already queued in the
+        // kernel, *before* arming the multishot recv: it drops records that
+        // are queued at arm time on a non-zero-RX-seq kTLS socket. See
         // `KtlsSocket::drain_queued_records`.
-        self.drain_queued_records();
-        let read_half = self
+        let prelude = std::mem::take(&mut self.prelude);
+        let Prelude { plaintext, action } = self.drain_queued_records(prelude);
+        match action {
+            ControlAction::Continue => KtlsMessages::open(self, plaintext),
+            ControlAction::End => KtlsMessages::closed(self, plaintext),
+            ControlAction::SendFatal { payload, err } => {
+                KtlsMessages::failing(self, plaintext, payload, err)
+            }
+        }
+    }
+}
+
+/// Constructors. All three take `drained`: the plaintext that arrived before
+/// any recv existed (decrypted by rustls at the end of the handshake, or read
+/// by the post-attach drain). It is yielded as the first frame, ahead of
+/// whatever the initial state does next.
+///
+/// They are crate-private on purpose: building a stream without going through
+/// `into_messages` would skip the drain, and the multishot recv silently drops
+/// records that were already queued when it armed.
+impl<R: BufRingSpec, S> KtlsMessages<R, S> {
+    /// The session is still open: yield `drained`, then arm the recv.
+    pub(crate) fn open(mut ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
+        let read_half = ktls
             .read_half
             .take()
-            .expect("read half is only taken by into_messages");
-        let recv = MultiRecv::new(read_half);
-        KtlsMessages {
-            ktls: self,
-            state: State::Recving(recv),
+            .expect("read half is only taken by a KtlsMessages constructor");
+        Self {
+            ktls,
+            pending: drained,
+            state: State::Recving(MultiRecv::new(read_half)),
         }
+    }
+
+    /// The peer already ended the session (close_notify or EOF consumed by
+    /// the handshake or the drain): yield `drained`, then `None`. No recv is
+    /// ever armed, since nothing on the socket will signal the close again.
+    /// The read half is dropped; the write half keeps the fd open for sends,
+    /// e.g. to answer a pipelined request.
+    pub(crate) fn closed(ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
+        Self {
+            ktls,
+            pending: drained,
+            state: State::Done,
+        }
+    }
+
+    /// A protocol violation was found while draining: yield `drained`, send
+    /// the fatal alert, then surface `err`.
+    fn failing(
+        ktls: KtlsSocket<S>,
+        drained: Option<Vec<u8>>,
+        payload: &'static [u8; 2],
+        err: std::io::Error,
+    ) -> Self {
+        let send = socket_send_control_record(ktls.as_socket(), TLS_RECORD_TYPE_ALERT, payload);
+        Self {
+            ktls,
+            pending: drained,
+            state: State::SendingFatal {
+                send,
+                err: Some(err),
+            },
+        }
+    }
+
+    /// The state that follows `action`. `read_half` is armed on `Continue`
+    /// and dropped otherwise (the write half keeps the fd open for sends).
+    fn next_state(ktls: &KtlsSocket<S>, read_half: OwnedReadHalf, action: ControlAction) -> State<R> {
+        match action {
+            ControlAction::Continue => State::Recving(MultiRecv::new(read_half)),
+            ControlAction::End => State::Done,
+            ControlAction::SendFatal { payload, err } => State::SendingFatal {
+                send: socket_send_control_record(ktls.as_socket(), TLS_RECORD_TYPE_ALERT, payload),
+                err: Some(err),
+            },
+        }
+    }
+
+    /// Apply `action` to a stream currently in `Recving`. The multishot has
+    /// terminated (the kernel ends it on any error CQE, e.g. the EIO that
+    /// signals a control record) and the driver never resubmits a terminated
+    /// op by itself, so the read half is taken back out of the old stream and,
+    /// on `Continue`, armed afresh.
+    fn transition(&mut self, action: ControlAction) {
+        let State::Recving(old) = std::mem::replace(&mut self.state, State::Done) else {
+            unreachable!("transition is only called from the Recving arm")
+        };
+        self.state = Self::next_state(&self.ktls, old.into_inner(), action);
     }
 }
 
@@ -220,27 +304,13 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     }
 }
 
-impl<R: BufRingSpec, S> KtlsMessages<R, S> {
-    /// Replace a multishot recv that terminated (the kernel ends it on any
-    /// error CQE, e.g. the EIO that signals a control record) with a fresh
-    /// one on the same read half. The driver never resubmits a terminated
-    /// op by itself, and `MultiRecv` owns the read half, so we have to take
-    /// the old stream out of `state` to get the half back.
-    fn rearm_recv(&mut self) {
-        let State::Recving(old) = std::mem::replace(&mut self.state, State::Done) else {
-            unreachable!("rearm_recv is only called from the Recving arm")
-        };
-        self.state = State::Recving(MultiRecv::new(old.into_inner()));
-    }
-}
-
 impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
     type Item = std::io::Result<Frame<R>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if let Some(buf) = this.ktls.pending_plaintext.take() {
+        if let Some(buf) = this.pending.take() {
             return Poll::Ready(Some(Ok(Frame::Owned(buf))));
         }
 
@@ -269,23 +339,11 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         return Poll::Ready(Some(Ok(Frame::Borrowed(buf))));
                     }
                     Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
+                        // The kernel is holding a control record. Read it and
+                        // let the resulting action pick the next state; the
+                        // loop then polls that state (`Done` yields `None`).
                         match this.ktls.handle_control_record() {
-                            Ok(ControlAction::Continue) => this.rearm_recv(),
-                            Ok(ControlAction::End) => {
-                                this.state = State::Done;
-                                return Poll::Ready(None);
-                            }
-                            Ok(ControlAction::SendFatal { payload, err }) => {
-                                let send = socket_send_control_record(
-                                    this.ktls.as_socket(),
-                                    TLS_RECORD_TYPE_ALERT,
-                                    payload,
-                                );
-                                this.state = State::SendingFatal {
-                                    send,
-                                    err: Some(err),
-                                };
-                            }
+                            Ok(action) => this.transition(action),
                             Err(e) => {
                                 this.state = State::Done;
                                 return Poll::Ready(Some(Err(e)));
@@ -298,15 +356,10 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         // AEAD verification failure: the kernel discarded a
                         // record we couldn't decrypt. Notify the peer with
                         // a `bad_record_mac` fatal alert (RFC 8446 §6).
-                        let send = socket_send_control_record(
-                            this.ktls.as_socket(),
-                            TLS_RECORD_TYPE_ALERT,
-                            &FATAL_BAD_RECORD_MAC,
-                        );
-                        this.state = State::SendingFatal {
-                            send,
-                            err: Some(std::io::Error::from_raw_os_error(libc::EBADMSG)),
-                        };
+                        this.transition(ControlAction::SendFatal {
+                            payload: &FATAL_BAD_RECORD_MAC,
+                            err: std::io::Error::from_raw_os_error(libc::EBADMSG),
+                        });
                     }
                     Poll::Ready(Some(Err(e))) => {
                         this.state = State::Done;
