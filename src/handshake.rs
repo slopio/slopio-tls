@@ -73,10 +73,9 @@ pub(crate) trait UnbufferedDriver: Sized {
     type Data;
     fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
     fn negotiated_alpn(&self) -> Option<&[u8]>;
-    /// `true` once rustls considers the handshake finished, i.e. secrets can
-    /// be extracted. Distinct from having *observed* a traffic state: a
-    /// close_notify pipelined right behind Finished completes the handshake
-    /// and reports `PeerClosed` in the same step.
+    /// Ask rustls, not `handshake_done`: a close_notify pipelined right
+    /// behind Finished completes the handshake and reports `PeerClosed` in
+    /// the same step, before any traffic state is observed.
     fn handshake_complete(&self) -> bool;
     fn into_kernel(self)
     -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error>;
@@ -91,10 +90,7 @@ impl UnbufferedDriver for UnbufferedServerConnection {
         self.alpn_protocol()
     }
     fn handshake_complete(&self) -> bool {
-        // Fully qualified: an unqualified `self.is_handshaking()` would
-        // resolve to nothing at this level and is easy to confuse with a
-        // trait method; the inherent one lives on `CommonState` via Deref.
-        !rustls::CommonState::is_handshaking(self)
+        !self.is_handshaking()
     }
     fn into_kernel(
         self,
@@ -129,10 +125,9 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     let mut filled: usize = 0;
     let mut pending_plaintext: Option<Vec<u8>> = None;
     let mut handshake_done = false;
+    // Bytes encoded into `out_buf` but not yet sent.
+    let mut pending: usize = 0;
 
-    // The loop's value is what the software phase leaves for the stream:
-    // records rustls decrypted after Finished, and whether the peer had
-    // already closed by the time we attach.
     let prelude = loop {
         let UnbufferedStatus { discard, state } = conn.step(&mut in_buf[..filled]);
 
@@ -157,19 +152,39 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
                 // peer sees a TCP close instead of a fatal alert. That is a
                 // rustls upstream gap, not something we can fix here without
                 // hand-encoding alerts with rustls's internal handshake keys.
-                drain_pending_alert(&mut conn, &socket, &mut in_buf, filled, out_buf).await;
+                drain_pending_alert(&mut conn, &socket, &mut in_buf, filled, out_buf, pending)
+                    .await;
                 return Err(HandshakeError::Rustls(e));
             }
         };
 
         match s {
             ConnectionState::EncodeTlsData(mut enc) => {
-                let n = enc.encode(&mut out_buf)?;
-                let (result, recovered) = send_all(&socket, out_buf, n).await;
+                // One record per step; accumulate and send the whole flight
+                // on `TransmitTlsData` (or when `out_buf` is full).
+                let n = match enc.encode(&mut out_buf[pending..]) {
+                    Ok(n) => n,
+                    Err(EncodeError::InsufficientSize(_)) => {
+                        // `enc` owns the record, already popped from rustls's
+                        // queue: dropping it here would lose it. Flush and
+                        // retry on the same `enc`.
+                        let (result, recovered) = send_all(&socket, out_buf, pending).await;
+                        out_buf = recovered;
+                        result?;
+                        pending = 0;
+                        enc.encode(&mut out_buf[..])?
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                pending += n;
+            }
+            ConnectionState::TransmitTlsData(t) => {
+                let (result, recovered) = send_all(&socket, out_buf, pending).await;
                 out_buf = recovered;
                 result?;
+                pending = 0;
+                t.done();
             }
-            ConnectionState::TransmitTlsData(t) => t.done(),
             ConnectionState::BlockedHandshake if handshake_done => {
                 return Err(HandshakeError::UnexpectedState(
                     "BlockedHandshake after handshake",
@@ -189,12 +204,9 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
                 handshake_done = true;
             }
             ConnectionState::PeerClosed | ConnectionState::Closed => {
-                // The peer sent close_notify. Whether that is an error depends
-                // on whether the handshake had already completed, which we
-                // can only ask rustls once `s` (borrowing `conn`) is gone —
-                // see the check after the loop. Records rustls already
-                // decrypted (a request pipelined between Finished and the
-                // alert) travel with the prelude either way.
+                // Error or not depends on whether the handshake had
+                // completed; `s` borrows `conn`, so that is checked after
+                // the loop.
                 break Prelude::closed(pending_plaintext.take());
             }
             ConnectionState::ReadEarlyData(_) => {
@@ -228,14 +240,20 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         }
     };
 
+    // rustls reports `PeerClosed` ahead of `TransmitTlsData`, so a flight can
+    // still be in `out_buf` here. Best-effort once the peer has closed.
+    if pending > 0 {
+        let (result, _) = send_all(&socket, out_buf, pending).await;
+        if !prelude.peer_closed() {
+            result?;
+        }
+    }
+
     if prelude.peer_closed() && !conn.handshake_complete() {
-        // close_notify mid-handshake: the peer gave up, nothing to attach.
         return Err(HandshakeError::PeerClosed);
     }
-    // close_notify *after* a complete handshake is a valid, finished session:
-    // attach as usual so TX works (the pipelined request may need a reply)
-    // and the prelude's plaintext is delivered, then the stream ends. The
-    // kernel never sees the alert, so the prelude is the only record of it.
+    // close_notify after a complete handshake: attach anyway so the pipelined
+    // request can be delivered and answered; the stream then ends.
 
     let alpn = conn
         .negotiated_alpn()
@@ -297,18 +315,26 @@ async fn recv_into(
 /// queued alert surfaces as `EncodeTlsData` on the next call. A fatal alert
 /// is a single record, so one pass is enough; calling again after sending
 /// would land in the deframer with a stale buffer and panic.
+///
+/// `pending` unsent bytes may sit in `out_buf`: rustls deframes incoming
+/// records before asking us to transmit. The alert is appended after them.
 async fn drain_pending_alert<C: UnbufferedDriver>(
     conn: &mut C,
     socket: &SocketWrapper,
     in_buf: &mut PooledBuf,
     filled: usize,
     mut out_buf: PooledBuf,
+    pending: usize,
 ) {
     let UnbufferedStatus { state, .. } = conn.step(&mut in_buf[..filled]);
+    let mut len = pending;
     if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state {
-        if let Ok(n) = enc.encode(&mut out_buf) {
-            let _ = send_all(socket, out_buf, n).await;
+        if let Ok(n) = enc.encode(&mut out_buf[pending..]) {
+            len += n;
         }
+    }
+    if len > 0 {
+        let _ = send_all(socket, out_buf, len).await;
     }
 }
 

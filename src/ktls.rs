@@ -14,31 +14,22 @@ pub struct KtlsSocket<S = ServerConnectionData> {
     pub(crate) read_half: Option<OwnedReadHalf>,
     pub(crate) kernel_conn: KernelConnection<S>,
     pub(crate) alpn: Option<&'static [u8]>,
-    /// What the software handshake left for the stream. Taken by
-    /// `into_messages`, which extends it with the kernel-queue drain.
+    /// What the software handshake left for the stream; see `Prelude`.
     pub(crate) prelude: Prelude,
     pub(crate) tx_records: u64,
 }
 
-/// Everything the receive side saw *before* a recv could be armed, as a
-/// value. Two phases produce one: the software handshake (records rustls
-/// decrypted after Finished) and the post-attach kernel-queue drain. Since
-/// those phases consume any close_notify or protocol violation they meet,
-/// the resulting `action` is the only record of it. `into_messages` picks
-/// the stream constructor from it: `KtlsMessages::open` on `Continue`,
-/// `KtlsMessages::closed` on `End`, and the fatal-alert path on `SendFatal`.
+/// What the receive side saw before a recv could be armed: plaintext
+/// decrypted by the software handshake or the kernel-queue drain, and how
+/// the session stands after it. Both phases consume any close_notify or
+/// violation they meet, so `action` is the only record of it.
 #[derive(Debug)]
 pub(crate) struct Prelude {
-    /// Application data decrypted before any recv existed. Yielded as the
-    /// first frame (`Frame::Owned`).
     pub plaintext: Option<Vec<u8>>,
-    /// How the receive side stands after that data: `Continue` (arm a
-    /// recv), `End` (peer closed) or `SendFatal` (violation to report).
     pub action: ControlAction,
 }
 
 impl Prelude {
-    /// Session still open after `plaintext`.
     pub fn open(plaintext: Option<Vec<u8>>) -> Self {
         Self {
             plaintext,
@@ -46,7 +37,6 @@ impl Prelude {
         }
     }
 
-    /// Peer sent close_notify (or EOF) after `plaintext`.
     pub fn closed(plaintext: Option<Vec<u8>>) -> Self {
         Self {
             plaintext,
@@ -104,11 +94,8 @@ impl<S> KtlsSocket<S> {
         self.tx_records
     }
 
-    /// `true` if the peer already ended the session during the handshake
-    /// (close_notify pipelined behind Finished). No more application data
-    /// will arrive; anything received before the close is still delivered by
-    /// `into_messages`, which then yields `None`. Sending remains possible,
-    /// e.g. to answer a pipelined request.
+    /// The peer sent close_notify during the handshake. `into_messages` still
+    /// delivers what arrived before it, then ends; sending remains possible.
     pub fn peer_closed(&self) -> bool {
         self.prelude.peer_closed()
     }
@@ -251,9 +238,8 @@ impl<S> KtlsSocket<S> {
         Ok(())
     }
 
-    /// One `recvmsg` into `buf` with a record-type cmsg attached. Returns
-    /// `(record_type, len)`; `record_type` is 0 when the kernel attached no
-    /// cmsg, which only happens on TCP EOF (`len == 0`).
+    /// One `recvmsg` into `buf`, returning `(record_type, len)`. The kernel
+    /// attaches no cmsg on TCP EOF, so that case reads as type 0, `len == 0`.
     fn recv_record(&self, buf: &mut PooledBuf, flags: libc::c_int) -> std::io::Result<(u8, usize)> {
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -280,14 +266,11 @@ impl<S> KtlsSocket<S> {
         Ok((cmsg.record_type, n as usize))
     }
 
-    /// How the stream reacts to one non-application-data record, as
-    /// delivered by [`recv_record`](Self::recv_record). Performs any RX rekey
-    /// (KeyUpdate) inline, but never sends an alert itself — alert emission
-    /// is async and driven by the stream's state machine.
-    ///
-    /// A zero-length payload is ambiguous: TCP EOF (no cmsg, type 0) or a
-    /// zero-byte control record (cmsg present, e.g. a malformed empty
-    /// alert). The arms below tell them apart by record type.
+    /// How the stream reacts to a non-application-data record. Rekeys RX
+    /// inline on KeyUpdate; never sends an alert itself (that is async, in
+    /// the stream's state machine). A zero-length payload is either TCP EOF
+    /// (type 0) or an empty control record (cmsg present), hence the arms
+    /// match on the type.
     fn control_action(&mut self, record_type: u8, payload: &[u8]) -> ControlAction {
         match record_type {
             TLS_RECORD_TYPE_HANDSHAKE => {
@@ -338,28 +321,19 @@ impl<S> KtlsSocket<S> {
         Ok(self.control_action(record_type, &buf[..n]))
     }
 
-    /// Synchronously drain every TLS record already queued in the kernel right
-    /// after attach, extending `prelude`: application data is appended to its
-    /// plaintext, control records are dispatched through
-    /// [`control_action`](Self::control_action), and the first non-`Continue`
-    /// action ends the drain and becomes the prelude's action. Uses
-    /// non-blocking `recvmsg`, stopping the instant the queue is empty
-    /// (`EAGAIN`) — no timing involved. A prelude that is already closed is
-    /// returned untouched.
+    /// Drain every record already queued in the kernel right after attach,
+    /// with non-blocking `recvmsg`: application data goes into the prelude's
+    /// plaintext, the first non-`Continue` control action ends the drain.
     ///
-    /// This is the deterministic replacement for a pre-attach grace-drain. The
-    /// io_uring multishot recv (`MultiRecv`) drops application-data records that
-    /// are already queued when it first arms on a kTLS socket whose RX sequence
-    /// is non-zero (which happens whenever the handshake software-decrypted a
-    /// pipelined record). Emptying the queue here means the multishot only ever
-    /// arms on an idle socket, where its post-arm delivery is reliable. The
-    /// blocking-`recvmsg` path used here has no such issue (verified by the
-    /// `ktls_queue_premise` tests). Call immediately before arming the recv.
+    /// Required, not an optimisation: the io_uring multishot recv drops
+    /// application-data records already queued when it arms on a kTLS socket
+    /// whose RX sequence is non-zero (i.e. whenever the handshake software-
+    /// decrypted a pipelined record). Blocking `recvmsg` has no such issue
+    /// (`ktls_queue_premise` tests). Call immediately before arming.
     ///
-    /// Because this consumes any close_notify or violation it meets, the
-    /// returned action is the only trace of it: a recv armed afterwards would
-    /// never see the alert and would wait for a TCP FIN that a half-closed
-    /// peer may never send.
+    /// A close_notify met here is consumed: a recv armed afterwards would
+    /// wait for a TCP FIN a half-closed peer may never send. The returned
+    /// action is the only trace of it.
     pub(crate) fn drain_queued_records(&mut self, prelude: Prelude) -> Prelude {
         let Prelude {
             mut plaintext,

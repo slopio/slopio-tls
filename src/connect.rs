@@ -25,7 +25,7 @@ impl UnbufferedDriver for UnbufferedClientConnection {
         self.alpn_protocol()
     }
     fn handshake_complete(&self) -> bool {
-        !rustls::CommonState::is_handshaking(self)
+        !self.is_handshaking()
     }
     fn into_kernel(
         self,
@@ -41,6 +41,8 @@ pub async fn connect(
     deadline: Duration,
 ) -> Result<KtlsSocket<ClientConnectionData>, HandshakeError> {
     let socket = connect_tcp(addr).await?;
+    // `connect_tcp` leaves Nagle on; accepted sockets get this from `MultiAccept`.
+    socket.set_nodelay(true)?;
     handshake_client(socket, server_name, config, deadline).await
 }
 

@@ -108,8 +108,7 @@ impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
 /// implemented because the application-level fix above is strictly better.
 pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
     ktls: KtlsSocket<S>,
-    /// Plaintext decrypted before the recv was armed (see `Prelude`).
-    /// Yielded as the first frame, ahead of whatever `state` says.
+    /// Plaintext decrypted before the recv was armed; the first frame.
     pending: Option<Vec<u8>>,
     state: State<R>,
 }
@@ -132,10 +131,8 @@ impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
     pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
-        // Extend what the handshake left with anything already queued in the
-        // kernel, *before* arming the multishot recv: it drops records that
-        // are queued at arm time on a non-zero-RX-seq kTLS socket. See
-        // `KtlsSocket::drain_queued_records`.
+        // Drain before arming: the multishot drops records already queued at
+        // arm time on a non-zero-RX-seq kTLS socket (see `drain_queued_records`).
         let prelude = std::mem::take(&mut self.prelude);
         let Prelude { plaintext, action } = self.drain_queued_records(prelude);
         match action {
@@ -148,16 +145,11 @@ impl<S> KtlsSocket<S> {
     }
 }
 
-/// Constructors. All three take `drained`: the plaintext that arrived before
-/// any recv existed (decrypted by rustls at the end of the handshake, or read
-/// by the post-attach drain). It is yielded as the first frame, ahead of
-/// whatever the initial state does next.
-///
-/// They are crate-private on purpose: building a stream without going through
-/// `into_messages` would skip the drain, and the multishot recv silently drops
-/// records that were already queued when it armed.
+/// Constructors, crate-private on purpose: building a stream without going
+/// through `into_messages` skips the drain, and the multishot recv silently
+/// drops records already queued when it arms. `drained` is yielded first.
 impl<R: BufRingSpec, S> KtlsMessages<R, S> {
-    /// The session is still open: yield `drained`, then arm the recv.
+    /// Session still open: arm the recv.
     pub(crate) fn open(mut ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
         let read_half = ktls
             .read_half
@@ -170,11 +162,9 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         }
     }
 
-    /// The peer already ended the session (close_notify or EOF consumed by
-    /// the handshake or the drain): yield `drained`, then `None`. No recv is
-    /// ever armed, since nothing on the socket will signal the close again.
-    /// The read half is dropped; the write half keeps the fd open for sends,
-    /// e.g. to answer a pipelined request.
+    /// The peer's close_notify was consumed by the handshake or the drain, so
+    /// nothing on the socket will signal it again: no recv is armed. The
+    /// write half keeps the fd open for sends.
     pub(crate) fn closed(ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
         Self {
             ktls,
@@ -183,8 +173,7 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         }
     }
 
-    /// A protocol violation was found while draining: yield `drained`, send
-    /// the fatal alert, then surface `err`.
+    /// Violation found while draining: send the fatal alert, then surface `err`.
     fn failing(
         ktls: KtlsSocket<S>,
         drained: Option<Vec<u8>>,
@@ -202,8 +191,7 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         }
     }
 
-    /// The state that follows `action`. `read_half` is armed on `Continue`
-    /// and dropped otherwise (the write half keeps the fd open for sends).
+    /// `read_half` is armed on `Continue`, dropped otherwise.
     fn next_state(ktls: &KtlsSocket<S>, read_half: OwnedReadHalf, action: ControlAction) -> State<R> {
         match action {
             ControlAction::Continue => State::Recving(MultiRecv::new(read_half)),
@@ -215,11 +203,9 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         }
     }
 
-    /// Apply `action` to a stream currently in `Recving`. The multishot has
-    /// terminated (the kernel ends it on any error CQE, e.g. the EIO that
-    /// signals a control record) and the driver never resubmits a terminated
-    /// op by itself, so the read half is taken back out of the old stream and,
-    /// on `Continue`, armed afresh.
+    /// The multishot is dead after any error CQE (e.g. the EIO signalling a
+    /// control record) and the driver never resubmits it: take the read half
+    /// back out and, on `Continue`, arm a fresh one.
     fn transition(&mut self, action: ControlAction) {
         let State::Recving(old) = std::mem::replace(&mut self.state, State::Done) else {
             unreachable!("transition is only called from the Recving arm")
@@ -339,9 +325,8 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         return Poll::Ready(Some(Ok(Frame::Borrowed(buf))));
                     }
                     Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
-                        // The kernel is holding a control record. Read it and
-                        // let the resulting action pick the next state; the
-                        // loop then polls that state (`Done` yields `None`).
+                        // A control record is waiting; its action picks the
+                        // next state, which the loop then polls.
                         match this.ktls.handle_control_record() {
                             Ok(action) => this.transition(action),
                             Err(e) => {
