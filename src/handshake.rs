@@ -9,7 +9,7 @@ use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use crate::config::Config;
 use crate::ktls::{KtlsSocket, Prelude};
-use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf, PooledScratch};
+use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -192,7 +192,7 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
             }
             ConnectionState::BlockedHandshake => {
                 shift(&mut in_buf, &mut filled, discard);
-                recv_more(&socket, &mut in_buf, &mut filled).await?;
+                in_buf = recv_more(&socket, in_buf, &mut filled).await?;
                 continue;
             }
             ConnectionState::WriteTraffic(_) => handshake_done = true,
@@ -236,7 +236,7 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
             // discard == 0 && filled > 0: a partial record head sits in `in_buf`
             // (out of the kernel's reach). Finish it in software so we attach on
             // a clean boundary; the loop re-steps and breaks on `filled == 0`.
-            recv_more(&socket, &mut in_buf, &mut filled).await?;
+            in_buf = recv_more(&socket, in_buf, &mut filled).await?;
         }
     };
 
@@ -270,37 +270,25 @@ fn shift(in_buf: &mut PooledBuf, filled: &mut usize, discard: usize) {
     }
 }
 
+/// Receive into `in_buf` after the `filled` bytes already there, advancing
+/// `filled` by what the kernel delivered. The buffer travels with the io_uring
+/// op (it must own it for cancel-safety) and comes back on success; on error
+/// it is dropped with the handshake.
 async fn recv_more(
     socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
+    in_buf: PooledBuf,
     filled: &mut usize,
-) -> Result<(), HandshakeError> {
+) -> Result<PooledBuf, HandshakeError> {
     if *filled == RECORD_BUF {
         return Err(HandshakeError::LeftoverBytes);
     }
-    recv_into(socket, in_buf, filled, RECORD_BUF - *filled).await
-}
-
-/// Pull up to `cap` bytes from `socket` into `in_buf` starting at `filled`,
-/// advancing `filled` by what the kernel actually delivered. `cap` bounds the
-/// kernel's write via the scratch buffer's `bytes_total`, so we never overrun
-/// `in_buf`'s remaining room — the caller is responsible for sizing `cap`
-/// against `RECORD_BUF - *filled`.
-async fn recv_into(
-    socket: &SocketWrapper,
-    in_buf: &mut PooledBuf,
-    filled: &mut usize,
-    cap: usize,
-) -> Result<(), HandshakeError> {
-    let scratch = PooledScratch::new(cap);
-    let (result, scratch) = socket_recv(socket, scratch).await;
+    let (result, tail) = socket_recv(socket, in_buf.tail(*filled)).await;
     let n = result.map_err(HandshakeError::Io)?;
     if n == 0 {
         return Err(HandshakeError::PeerClosed);
     }
-    in_buf[*filled..*filled + n].copy_from_slice(&scratch[..n]);
     *filled += n;
-    Ok(())
+    Ok(tail.into_inner())
 }
 
 /// After `process_tls_records` returns `Err`, rustls has queued a fatal alert

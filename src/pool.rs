@@ -61,7 +61,7 @@ impl Drop for PooledBuf {
 // - `bytes_init` returns the full box length, which is fixed at construction.
 // - No lifetimes; satisfies `'static`. `Option<Box<[u8]>>` is `Unpin`.
 // Callers that want to expose fewer than `BUFFER_SIZE` bytes to the kernel
-// should wrap the buffer in `.slice(0..n)` (for sends) or use `PooledScratch`
+// should wrap the buffer in `.slice(0..n)` (for sends) or `.tail(offset)`
 // (for recvs, since `IoBufMut` has no slice form upstream).
 unsafe impl IoBuf for PooledBuf {
     fn stable_ptr(&self) -> *const u8 {
@@ -72,46 +72,45 @@ unsafe impl IoBuf for PooledBuf {
     }
 }
 
-/// `IoBufMut` wrapper around a `PooledBuf` that caps the writable region the
-/// kernel sees to `cap` bytes. Use for recvs that need a bounded landing zone
-/// (e.g. handshake `recv_more`, which must not let the kernel write past the
-/// remaining room in the deframer buffer).
-pub(crate) struct PooledScratch {
-    buf: PooledBuf,
-    cap: usize,
-}
-
-impl PooledScratch {
-    pub fn new(cap: usize) -> Self {
+impl PooledBuf {
+    /// `IoBufMut` view of this buffer starting at `offset`: the kernel may
+    /// only write into `[offset, len)`, so a recv appends after bytes already
+    /// held (a partial record in the handshake deframer buffer) instead of
+    /// landing in a scratch buffer that then has to be copied.
+    pub fn tail(self, offset: usize) -> PooledTail {
         assert!(
-            cap <= BUFFER_SIZE,
-            "scratch cap {cap} exceeds pool buffer size"
+            offset <= self.len(),
+            "tail offset {offset} exceeds pool buffer size"
         );
-        Self {
-            buf: PooledBuf::new(),
-            cap,
-        }
+        PooledTail { buf: self, offset }
     }
 }
 
-impl Deref for PooledScratch {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        &self.buf[..self.cap]
+pub(crate) struct PooledTail {
+    buf: PooledBuf,
+    offset: usize,
+}
+
+impl PooledTail {
+    pub fn into_inner(self) -> PooledBuf {
+        self.buf
     }
 }
 
 // SAFETY:
-// - Inherits stable-pointer guarantee from `PooledBuf` (Box heap data).
-// - `bytes_total` returns `cap`, fixed at construction.
+// - Inherits stable-pointer guarantee from `PooledBuf` (Box heap data); the
+//   box does not move when the wrapper does.
+// - `offset <= len` is asserted at construction, so `ptr.add(offset)` stays
+//   inside the allocation and `bytes_total = len - offset` keeps every
+//   kernel write inside it too.
 // - `set_init` is a no-op: the box length is fixed, and the caller uses the
 //   recv's returned byte count to know how many bytes were written.
-unsafe impl IoBufMut for PooledScratch {
+unsafe impl IoBufMut for PooledTail {
     fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
+        unsafe { self.buf.as_mut_ptr().add(self.offset) }
     }
     fn bytes_total(&self) -> usize {
-        self.cap
+        self.buf.len() - self.offset
     }
     unsafe fn set_init(&mut self, _n: usize) {}
 }
