@@ -61,10 +61,14 @@ impl Default for Prelude {
 /// next; this enum carries no I/O of its own.
 #[derive(Debug)]
 pub(crate) enum ControlAction {
-    /// A valid KeyUpdate was processed (RX rekeyed, optional TX rekey already
-    /// emitted via the synchronous `initiate_key_update` path). Continue
-    /// receiving on the same socket.
+    /// A valid KeyUpdate was processed (RX rekeyed). Continue receiving on
+    /// the same socket.
     Continue,
+    /// A peer KeyUpdate asked us to rekey our TX too (`request_update`). RX is
+    /// already rekeyed; the caller must send our own KeyUpdate over kTLS and
+    /// then rotate the TX key (`rotate_tx_key`) before resuming the recv. The
+    /// send is async (io_uring), so it cannot happen inline here.
+    SendKeyUpdate,
     /// Peer ended the stream cleanly (close_notify alert, any other alert
     /// — RFC 8446 §6 treats all non-close_notify alerts as fatal — or zero-
     /// length recv = EOF). No reply needed; move to `Done`.
@@ -101,14 +105,13 @@ impl<S> KtlsSocket<S> {
         self.prelude.peer_closed()
     }
 
-    pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
-        unsafe {
-            send_control_record(
-                self.fd(),
-                TLS_RECORD_TYPE_HANDSHAKE,
-                &KEY_UPDATE_NOT_REQUESTED,
-            )?;
-        }
+    /// Rotate the TX key: derive the next sending secret and install it in the
+    /// kernel. Call this only *after* the KeyUpdate record announcing the
+    /// change has been sent over kTLS (RFC 8446 §4.6.3 order: the peer must
+    /// still decrypt that record under the old key). The send itself is async
+    /// and lives in the caller (`KtlsMessages`); this is the synchronous
+    /// `setsockopt` tail, which never blocks.
+    pub(crate) fn rotate_tx_key(&mut self) -> std::io::Result<()> {
         let (seq, secret) = self
             .kernel_conn
             .update_tx_secret()
@@ -159,9 +162,12 @@ impl<S> KtlsSocket<S> {
     }
 
     /// Walk every TLS 1.3 handshake message inside one post-handshake record,
-    /// applying side effects as we go. Returns `Err(ControlAction::SendFatal)`
-    /// on protocol violations so the caller can return it up the stack.
-    fn process_handshake_messages(&mut self, mut payload: &[u8]) -> Result<(), ControlAction> {
+    /// applying side effects as we go. Rekeys RX inline (a non-blocking
+    /// `setsockopt`). Returns `Ok(true)` if any KeyUpdate asked us to rekey TX
+    /// too — the TX send is async, so the caller drives it — `Ok(false)`
+    /// otherwise, or `Err(ControlAction::SendFatal)` on a protocol violation.
+    fn process_handshake_messages(&mut self, mut payload: &[u8]) -> Result<bool, ControlAction> {
+        let mut tx_rekey_owed = false;
         while !payload.is_empty() {
             if payload.len() < 4 {
                 return Err(ControlAction::SendFatal {
@@ -214,11 +220,7 @@ impl<S> KtlsSocket<S> {
                         })?;
                     }
                     if request_update {
-                        self.initiate_key_update()
-                            .map_err(|e| ControlAction::SendFatal {
-                                payload: &FATAL_DECODE_ERROR,
-                                err: e,
-                            })?;
+                        tx_rekey_owed = true;
                     }
                 }
                 HANDSHAKE_NEW_SESSION_TICKET => {
@@ -236,7 +238,7 @@ impl<S> KtlsSocket<S> {
             }
             payload = &payload[4 + body_len..];
         }
-        Ok(())
+        Ok(tx_rekey_owed)
     }
 
     /// One `recvmsg` into `buf`, returning `(record_type, len)`. The kernel
@@ -289,7 +291,8 @@ impl<S> KtlsSocket<S> {
                 // Anything else is unexpected_message; malformed framing is
                 // decode_error.
                 match self.process_handshake_messages(payload) {
-                    Ok(()) => ControlAction::Continue,
+                    Ok(true) => ControlAction::SendKeyUpdate,
+                    Ok(false) => ControlAction::Continue,
                     Err(action) => action,
                 }
             }
@@ -326,15 +329,18 @@ impl<S> KtlsSocket<S> {
 const SOL_TLS: libc::c_int = 282;
 const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
-const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 pub(crate) const TLS_RECORD_TYPE_ALERT: u8 = 21;
-const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
+pub(crate) const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
 const TLS_1_3_VERSION: u16 = 0x0304;
 
-const KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0];
+// The KeyUpdate we emit (RFC 8446 §4.6.3): HandshakeType(24) || uint24 len(1)
+// || update_not_requested(0). `request_update` is 0 — replying to a peer's
+// request with another request would loop. Static so the async send future
+// can borrow it with a `'static` lifetime.
+pub(crate) static KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 0, 1, 0];
 
 // RFC 8446 §6 fatal alert payloads. Static so the async send future can
 // borrow them with a `'static` lifetime and live in the `KtlsMessages`
@@ -491,37 +497,4 @@ unsafe fn set_crypto_info(
 struct TlsCmsg {
     hdr: libc::cmsghdr,
     record_type: u8,
-}
-
-/// Synchronous control-record send. Used only by `initiate_key_update`,
-/// which is application-initiated and not on the error path, so a blocking
-/// sendmsg syscall (returns immediately on a non-blocking socket for a
-/// 5-byte payload) is acceptable. Fatal-alert sends go through the async
-/// `runtime::net::socket_send_control_record` path instead.
-unsafe fn send_control_record(fd: i32, record_type: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mut iov = libc::iovec {
-        iov_base: payload.as_ptr() as *mut libc::c_void,
-        iov_len: payload.len(),
-    };
-
-    let mut cmsg = TlsCmsg {
-        hdr: unsafe { std::mem::zeroed() },
-        record_type,
-    };
-    cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
-    cmsg.hdr.cmsg_level = SOL_TLS;
-    cmsg.hdr.cmsg_type = TLS_SET_RECORD_TYPE;
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
-    msg.msg_controllen = size_of::<TlsCmsg>() as _;
-
-    let n = unsafe { libc::sendmsg(fd, &msg, 0) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }

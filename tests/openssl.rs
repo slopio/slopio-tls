@@ -423,6 +423,82 @@ fn peer_initiated_key_update_round_trip() {
     );
 }
 
+/// Peer sends a KeyUpdate with `update_requested` (OpenSSL's uppercase `K`),
+/// so we must rekey RX *and* send our own KeyUpdate + rotate TX. This drives
+/// the async `SendingKeyUpdate` path in `poll_next`; the echo must keep
+/// working in both directions afterwards.
+#[test]
+fn peer_requested_key_update_round_trip() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread_with::<MediumRing, _>(async move {
+            let cfg = make_config(None);
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = acc.next().await.expect("accept");
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("handshake");
+            let mut stream = ktls.into_messages::<MediumRing>();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(frame) => {
+                        let data: &[u8] = frame.as_ref();
+                        if stream.send(data.to_vec()).await.0.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-tls1_3",
+            "-servername",
+            "localhost",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openssl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        write!(stdin, "BEFORE_REQ_KU\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        // Uppercase K: KeyUpdate requesting the peer to update too.
+        write!(stdin, "K\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "AFTER_REQ_KU\n").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        write!(stdin, "Q\n").unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+
+    server.join().expect("server thread");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BEFORE_REQ_KU"),
+        "missing pre-KU echo: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("AFTER_REQ_KU"),
+        "missing post-KU echo (reciprocal KeyUpdate handling failed?): {stdout:?}"
+    );
+}
+
 #[test]
 fn server_initiated_key_update_round_trip() {
     init_provider();
@@ -451,7 +527,7 @@ fn server_initiated_key_update_round_trip() {
                 "tx_records should have incremented after first send"
             );
 
-            stream.initiate_key_update().expect("initiate_key_update");
+            stream.initiate_key_update().await.expect("initiate_key_update");
             assert_eq!(
                 stream.tx_records(),
                 0,

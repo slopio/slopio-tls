@@ -11,7 +11,8 @@ use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
 
 use crate::ktls::{
-    ControlAction, FATAL_BAD_RECORD_MAC, KtlsSocket, Prelude, TLS_RECORD_TYPE_ALERT,
+    ControlAction, FATAL_BAD_RECORD_MAC, KEY_UPDATE_NOT_REQUESTED, KtlsSocket, Prelude,
+    TLS_RECORD_TYPE_ALERT, TLS_RECORD_TYPE_HANDSHAKE,
 };
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
@@ -124,6 +125,15 @@ enum State<R: BufRingSpec> {
         send: WriteControlRecord<'static>,
         err: Option<std::io::Error>,
     },
+    /// A peer KeyUpdate asked us to rekey TX (`request_update`). Our own
+    /// KeyUpdate is being sent over kTLS under the old key; once it lands we
+    /// rotate the TX key and resume receiving on `read` (which the terminated
+    /// multishot handed back). The rotation cannot happen before the send:
+    /// the peer must decrypt the announcing record under the old key.
+    SendingKeyUpdate {
+        send: WriteControlRecord<'static>,
+        read: OwnedReadHalf,
+    },
     Done,
 }
 
@@ -143,6 +153,10 @@ impl<S> KtlsSocket<S> {
             ControlAction::SendFatal { payload, err } => {
                 KtlsMessages::failing(self, plaintext, payload, err)
             }
+            // The handshake never produces SendKeyUpdate: KeyUpdate is a
+            // post-handshake message, so the prelude action is only ever
+            // Continue, End or SendFatal.
+            ControlAction::SendKeyUpdate => KtlsMessages::open(self, plaintext),
         }
     }
 }
@@ -202,6 +216,14 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
                 send: socket_send_control_record(ktls.as_socket(), TLS_RECORD_TYPE_ALERT, payload),
                 err: Some(err),
             },
+            ControlAction::SendKeyUpdate => State::SendingKeyUpdate {
+                send: socket_send_control_record(
+                    ktls.as_socket(),
+                    TLS_RECORD_TYPE_HANDSHAKE,
+                    &KEY_UPDATE_NOT_REQUESTED,
+                ),
+                read: read_half,
+            },
         }
     }
 
@@ -225,8 +247,19 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         self.ktls.tx_records()
     }
 
-    pub fn initiate_key_update(&mut self) -> std::io::Result<()> {
-        self.ktls.initiate_key_update()
+    /// Rotate our TX key: send a KeyUpdate over kTLS (async, io_uring — never
+    /// blocks the executor), then install the next sending key. The KeyUpdate
+    /// goes out under the old key, as RFC 8446 §4.6.3 requires, before the
+    /// rotation. Application-initiated; the peer-requested rekey is driven by
+    /// the recv state machine instead.
+    pub async fn initiate_key_update(&mut self) -> std::io::Result<()> {
+        socket_send_control_record(
+            self.ktls.as_socket(),
+            TLS_RECORD_TYPE_HANDSHAKE,
+            &KEY_UPDATE_NOT_REQUESTED,
+        )
+        .await?;
+        self.ktls.rotate_tx_key()
     }
 
     /// Send the entire plaintext buffer over the kTLS socket, looping over
@@ -313,6 +346,28 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         let e = err
                             .take()
                             .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
+                        this.state = State::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                State::SendingKeyUpdate { send, .. } => match Pin::new(send).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(_)) => {
+                        // Our KeyUpdate is on the wire under the old key; now
+                        // rotate TX and resume receiving on the handed-back
+                        // read half.
+                        if let Err(e) = this.ktls.rotate_tx_key() {
+                            this.state = State::Done;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        let State::SendingKeyUpdate { read, .. } =
+                            std::mem::replace(&mut this.state, State::Done)
+                        else {
+                            unreachable!("just matched SendingKeyUpdate")
+                        };
+                        this.state = State::Recving(MultiRecv::new(read));
+                    }
+                    Poll::Ready(Err(e)) => {
                         this.state = State::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
