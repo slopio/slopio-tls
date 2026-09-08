@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 
 use runtime::net::{IoBuf, IoBufMut};
-use zeroize::Zeroize;
 
 pub(crate) const BUFFER_SIZE: usize = 17 * 1024;
 
@@ -43,8 +42,13 @@ impl DerefMut for PooledBuf {
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        if let Some(mut buf) = self.inner.take() {
-            buf.zeroize();
+        // No wipe: these buffers hold handshake records (public certificates,
+        // signatures, MACs) and, transiently, application plaintext — never
+        // key material (that transits `set_crypto_info`, which zeroizes its own
+        // structs, and lives in rustls/the kernel). Application plaintext is
+        // handed to the caller in un-wiped `Vec`s and ring buffers anyway, so
+        // wiping the pooled copy bought nothing for a 17 KB memset per drop.
+        if let Some(buf) = self.inner.take() {
             POOL.with(|p| {
                 let mut pool = p.borrow_mut();
                 if pool.len() < POOL_MAX_LEN {

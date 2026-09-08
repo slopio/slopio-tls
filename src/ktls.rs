@@ -2,6 +2,7 @@ use runtime::net::{OwnedReadHalf, OwnedWriteHalf, SocketWrapper};
 use rustls::kernel::KernelConnection;
 use rustls::server::ServerConnectionData;
 use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};
+use zeroize::Zeroize;
 
 use crate::pool::PooledBuf;
 
@@ -392,6 +393,10 @@ const TLS_CIPHER_AES_GCM_128: u16 = 51;
 const TLS_CIPHER_AES_GCM_256: u16 = 52;
 const TLS_CIPHER_CHACHA20_POLY1305: u16 = 54;
 
+// These structs carry the AEAD key into the kernel. They are the only place
+// key material lands in this crate's own memory (rustls and the kernel hold
+// the rest), so `setsockopt_crypto` wipes them right after `setsockopt` copies
+// them in.
 #[repr(C)]
 struct TlsCryptoInfo {
     version: u16,
@@ -422,6 +427,31 @@ struct Tls12CryptoInfoChacha20Poly1305 {
     iv: [u8; 12],
     key: [u8; 32],
     rec_seq: [u8; 8],
+}
+
+/// `setsockopt(SOL_TLS, dir, info)` then wipe the local `info`: the kernel has
+/// copied the key by the time the syscall returns, so our copy must not linger
+/// in the stack frame. Wiping the whole `#[repr(C)]` struct as raw bytes (via
+/// `Zeroize for [u8]`, volatile so it is not optimised away) avoids a derive.
+///
+/// # Safety
+/// `dir` must be `TLS_TX` or `TLS_RX` and `fd` a kTLS-attached socket. `T` must
+/// be one of the `#[repr(C)]` `Tls12CryptoInfo*` structs (plain bytes, no
+/// `Drop`, no padding invariants), so wiping its whole footprint is sound.
+unsafe fn setsockopt_crypto<T>(fd: i32, dir: libc::c_int, mut info: T) -> libc::c_int {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            SOL_TLS,
+            dir,
+            &info as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&info) as libc::socklen_t,
+        )
+    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(&mut info as *mut T as *mut u8, size_of::<T>()) };
+    bytes.zeroize();
+    ret
 }
 
 fn arr_ref<'a, const N: usize>(
@@ -457,15 +487,7 @@ unsafe fn set_crypto_info(
                 key: *key,
                 rec_seq,
             };
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    SOL_TLS,
-                    dir,
-                    &info as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&info) as libc::socklen_t,
-                )
-            }
+            unsafe { setsockopt_crypto(fd, dir, info) }
         }
         ConnectionTrafficSecrets::Aes256Gcm { key, iv } => {
             let iv: &[u8; 12] = arr_ref(iv.as_ref(), "Aes256Gcm IV")?;
@@ -480,15 +502,7 @@ unsafe fn set_crypto_info(
                 key: *key,
                 rec_seq,
             };
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    SOL_TLS,
-                    dir,
-                    &info as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&info) as libc::socklen_t,
-                )
-            }
+            unsafe { setsockopt_crypto(fd, dir, info) }
         }
         ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
             let iv: &[u8; 12] = arr_ref(iv.as_ref(), "Chacha20Poly1305 IV")?;
@@ -502,15 +516,7 @@ unsafe fn set_crypto_info(
                 key: *key,
                 rec_seq,
             };
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    SOL_TLS,
-                    dir,
-                    &info as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&info) as libc::socklen_t,
-                )
-            }
+            unsafe { setsockopt_crypto(fd, dir, info) }
         }
         _ => {
             return Err(std::io::Error::new(
