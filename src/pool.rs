@@ -73,22 +73,30 @@ unsafe impl IoBuf for PooledBuf {
 }
 
 impl PooledBuf {
-    /// `IoBufMut` view of this buffer starting at `offset`: the kernel may
-    /// only write into `[offset, len)`, so a recv appends after bytes already
+    /// `IoBufMut` view of this buffer over `[offset, end)`: the kernel may
+    /// only write into that window, so a recv appends after bytes already
     /// held (a partial record in the handshake deframer buffer) instead of
-    /// landing in a scratch buffer that then has to be copied.
-    pub fn tail(self, offset: usize) -> PooledTail {
+    /// landing in a scratch buffer that then has to be copied. `end` caps
+    /// the write, e.g. to consume exactly up to a TLS record boundary.
+    pub fn window(self, offset: usize, end: usize) -> PooledTail {
         assert!(
-            offset <= self.len(),
-            "tail offset {offset} exceeds pool buffer size"
+            offset <= end && end <= self.len(),
+            "window [{offset}, {end}) out of pool buffer bounds"
         );
-        PooledTail { buf: self, offset }
+        PooledTail { buf: self, offset, end }
+    }
+
+    /// `window(offset, len)`: everything from `offset` to the end.
+    pub fn tail(self, offset: usize) -> PooledTail {
+        let end = self.len();
+        self.window(offset, end)
     }
 }
 
 pub(crate) struct PooledTail {
     buf: PooledBuf,
     offset: usize,
+    end: usize,
 }
 
 impl PooledTail {
@@ -100,8 +108,8 @@ impl PooledTail {
 // SAFETY:
 // - Inherits stable-pointer guarantee from `PooledBuf` (Box heap data); the
 //   box does not move when the wrapper does.
-// - `offset <= len` is asserted at construction, so `ptr.add(offset)` stays
-//   inside the allocation and `bytes_total = len - offset` keeps every
+// - `offset <= end <= len` is asserted at construction, so `ptr.add(offset)`
+//   stays inside the allocation and `bytes_total = end - offset` keeps every
 //   kernel write inside it too.
 // - `set_init` is a no-op: the box length is fixed, and the caller uses the
 //   recv's returned byte count to know how many bytes were written.
@@ -110,7 +118,7 @@ unsafe impl IoBufMut for PooledTail {
         unsafe { self.buf.as_mut_ptr().add(self.offset) }
     }
     fn bytes_total(&self) -> usize {
-        self.buf.len() - self.offset
+        self.end - self.offset
     }
     unsafe fn set_init(&mut self, _n: usize) {}
 }

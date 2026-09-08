@@ -4,17 +4,19 @@
 //!
 //! `close_notify_data_loss.rs` covers the multishot path. These two tests
 //! cover the two earlier timings, where the alert is swallowed before any
-//! recv is armed:
+//! recv is armed. The server bounds its handshake reads at the client's
+//! Finished, so in both cases the request and close_notify pipelined behind
+//! it stay in the kernel queue and are consumed by the post-attach drain
+//! (`drain_queued_records`), not the software handshake:
 //!
-//! 1. The alert is queued in the kernel when `into_messages` runs, so the
-//!    post-attach drain consumes it (`drain_queued_records`).
-//! 2. The alert lands in the software handshake buffer together with
-//!    Finished and the request, so rustls reports `PeerClosed` *after*
-//!    handing over the request.
+//! 1. The client sends the burst a little after the handshake, so it is
+//!    plainly queued when `into_messages` runs.
+//! 2. The client coalesces the burst into the same TCP segment as its
+//!    Finished; the server still stops at the Finished and drains the rest.
 //!
 //! In both cases the client keeps its TCP socket open: a server that only
-//! ends the stream on FIN hangs, and a server that treats `PeerClosed` as a
-//! failed handshake loses the request.
+//! ends the stream on FIN hangs, and a server that loses the queued request
+//! fails the assertion.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -191,9 +193,12 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
                 let ktls = handshake(socket, cfg, Duration::from_secs(5))
                     .await
                     .map_err(|e| format!("handshake failed on pipelined close_notify: {e}"))?;
-                if !ktls.peer_closed() {
-                    return Err("peer_closed not set after pipelined close_notify".into());
-                }
+                // The server bounds its reads at the client's Finished, so the
+                // request and close_notify pipelined behind it stay in the
+                // kernel queue; the post-attach drain in `into_messages`
+                // picks them up. `peer_closed()` therefore reflects the drain,
+                // not the handshake — the contract is the observable sequence
+                // below: the request frame, then `None`, with TX still usable.
                 let mut stream = ktls.into_messages::<MediumRing>();
                 let first = timeout(Duration::from_secs(2), stream.next())
                     .await

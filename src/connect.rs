@@ -27,6 +27,9 @@ impl UnbufferedDriver for UnbufferedClientConnection {
     fn handshake_complete(&self) -> bool {
         !self.is_handshaking()
     }
+    fn bounded_reads(&self) -> bool {
+        false
+    }
     fn into_kernel(
         self,
     ) -> Result<(ExtractedSecrets, KernelConnection<Self::Data>), rustls::Error> {
