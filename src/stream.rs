@@ -131,10 +131,12 @@ impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
     pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
-        // Drain before arming: the multishot drops records already queued at
-        // arm time on a non-zero-RX-seq kTLS socket (see `drain_queued_records`).
-        let prelude = std::mem::take(&mut self.prelude);
-        let Prelude { plaintext, action } = self.drain_queued_records(prelude);
+        // No pre-arm drain: the server bounds its handshake reads at the
+        // client's Finished (RX seq 0), and the multishot delivers records
+        // already queued when it arms — including control records, via its
+        // EIO path — so it needs no help. Verified by the `large_pipeline`
+        // and `queued_before_multirecv` tests.
+        let Prelude { plaintext, action } = std::mem::take(&mut self.prelude);
         match action {
             ControlAction::Continue => KtlsMessages::open(self, plaintext),
             ControlAction::End => KtlsMessages::closed(self, plaintext),

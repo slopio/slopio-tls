@@ -239,12 +239,11 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
         shift(&mut in_buf, &mut filled, discard);
 
         if handshake_done {
-            // Records already pipelined into `in_buf` during the handshake recv
-            // are sliced out into `pending_plaintext` here, in software. Records
-            // still in the kernel queue are NOT drained here — they're handled
-            // after attach by `KtlsSocket::drain_queued_records` (a non-blocking
-            // recvmsg loop), which is the deterministic replacement for the old
-            // pre-attach grace-drain.
+            // Records pipelined into `in_buf` during the handshake recv are
+            // sliced into `pending_plaintext` here (the client's greedy path;
+            // the server's bounded read stops at the Finished, so it sees
+            // none). Anything left in the kernel queue is delivered by the
+            // multishot recv after attach — no pre-arm drain.
             if discard > 0 {
                 // rustls consumed a record this step; loop so it can slice the
                 // next complete one out of `in_buf` into `pending_plaintext`.

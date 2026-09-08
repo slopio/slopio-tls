@@ -1,20 +1,18 @@
-//! `Frame::Owned` / leftover-after-Finished test.
+//! Coalesced-app-data-behind-Finished delivery test.
 //!
-//! When the client coalesces an application-data record into the same
-//! TCP segment as its Finished, the server's handshake loop sees both
-//! records in a single recv. After Finished is processed, rustls
-//! transitions to `ReadTraffic` and the loop drains the remaining
-//! plaintext into `pending_plaintext` (see `src/handshake.rs:172`).
-//! `KtlsSocket::establish` then carries it across, and `KtlsMessages`
-//! yields it as `Frame::Owned` *before* any kernel-decrypted
-//! `Frame::Borrowed` (see `src/stream.rs:172`).
+//! When the client coalesces an application-data record into the same TCP
+//! segment as its Finished, the server's bounded handshake read must stop at
+//! the Finished and leave the request in the kernel queue, where the
+//! multishot recv then delivers it as `Frame::Borrowed`. This checks the data
+//! survives that boundary intact (it used to be decrypted in software and
+//! surface as `Frame::Owned`, before bounded reads).
 //!
-//! The kernel doesn't naturally guarantee this coalescing (separate
-//! `send` syscalls usually land in separate TCP segments), so we drive
-//! it with a TCP proxy that holds the client's Finished record until
-//! the *next* record arrives, then flushes both with a single
-//! `write_all`. That's the highest-fidelity way to put both records
-//! into the server's first post-CCS recv.
+//! The kernel doesn't naturally guarantee this coalescing (separate `send`
+//! syscalls usually land in separate TCP segments), so we drive it with a TCP
+//! proxy that holds the client's Finished record until the *next* record
+//! arrives, then flushes both with a single `write_all` — the
+//! highest-fidelity way to put both records into the server's first post-CCS
+//! recv.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -132,7 +130,7 @@ fn forward_plain(mut from: TcpStream, mut to: TcpStream) {
 }
 
 #[test]
-fn coalesced_app_data_surfaces_as_frame_owned() {
+fn coalesced_app_data_behind_finished_is_delivered() {
     init_provider();
     let server_port = pick_port();
     let proxy_port = pick_port();
@@ -229,11 +227,12 @@ fn coalesced_app_data_surfaces_as_frame_owned() {
 
     let (is_owned, first) = first_frame_rx.recv().expect("server should report a frame");
     let _ = client_release_tx.send(());
+    // The bounded handshake read stops at the Finished, so the coalesced
+    // request stays queued and the multishot delivers it as `Frame::Borrowed`.
     assert!(
-        is_owned,
-        "expected Frame::Owned (pending_plaintext leftover path), \
-         got Frame::Borrowed — proxy coalescing did not put both records \
-         into the server's first post-CCS recv"
+        !is_owned,
+        "expected Frame::Borrowed (kernel/multishot path after bounded read), \
+         got Frame::Owned — the server decrypted app data during the handshake"
     );
     assert_eq!(first, b"coalesced-with-finished");
 

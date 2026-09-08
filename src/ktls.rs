@@ -321,50 +321,6 @@ impl<S> KtlsSocket<S> {
         let (record_type, n) = self.recv_record(&mut buf, 0)?;
         Ok(self.control_action(record_type, &buf[..n]))
     }
-
-    /// Drain every record already queued in the kernel right after attach,
-    /// with non-blocking `recvmsg`: application data goes into the prelude's
-    /// plaintext, the first non-`Continue` control action ends the drain.
-    ///
-    /// Required, not an optimisation: the io_uring multishot recv drops
-    /// application-data records already queued when it arms on a kTLS socket
-    /// whose RX sequence is non-zero (i.e. whenever the handshake software-
-    /// decrypted a pipelined record). Blocking `recvmsg` has no such issue
-    /// (`ktls_queue_premise` tests). Call immediately before arming.
-    ///
-    /// A close_notify met here is consumed: a recv armed afterwards would
-    /// wait for a TCP FIN a half-closed peer may never send. The returned
-    /// action is the only trace of it.
-    pub(crate) fn drain_queued_records(&mut self, prelude: Prelude) -> Prelude {
-        let Prelude {
-            mut plaintext,
-            action,
-        } = prelude;
-        if !matches!(action, ControlAction::Continue) {
-            return Prelude { plaintext, action };
-        }
-        let mut buf = PooledBuf::new();
-        let action = loop {
-            let (record_type, n) = match self.recv_record(&mut buf, libc::MSG_DONTWAIT) {
-                Ok(rec) => rec,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // EAGAIN/EWOULDBLOCK: queue drained. Any other error resurfaces
-                // on the real read path once the recv is armed.
-                Err(_) => break ControlAction::Continue,
-            };
-            if record_type == TLS_RECORD_TYPE_APPLICATION_DATA {
-                plaintext
-                    .get_or_insert_with(Vec::new)
-                    .extend_from_slice(&buf[..n]);
-                continue;
-            }
-            match self.control_action(record_type, &buf[..n]) {
-                ControlAction::Continue => continue, // KeyUpdate / NewSessionTicket handled
-                action => break action,
-            }
-        };
-        Prelude { plaintext, action }
-    }
 }
 
 const SOL_TLS: libc::c_int = 282;
@@ -374,7 +330,6 @@ const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 pub(crate) const TLS_RECORD_TYPE_ALERT: u8 = 21;
 const TLS_RECORD_TYPE_HANDSHAKE: u8 = 22;
-const TLS_RECORD_TYPE_APPLICATION_DATA: u8 = 23;
 const HANDSHAKE_KEY_UPDATE: u8 = 24;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
 const TLS_1_3_VERSION: u16 = 0x0304;
