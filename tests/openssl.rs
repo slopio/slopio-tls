@@ -142,7 +142,7 @@ fn echo_round_trip() {
 
     {
         let mut stdin = child.stdin.take().unwrap();
-        write!(stdin, "PING\n").unwrap();
+        writeln!(stdin, "PING").unwrap();
     }
     let out = child.wait_with_output().expect("wait");
 
@@ -338,9 +338,9 @@ fn stream_echo_round_trip() {
 
     {
         let mut stdin = child.stdin.take().unwrap();
-        write!(stdin, "STREAM_PING\n").unwrap();
+        writeln!(stdin, "STREAM_PING").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "Q\n").unwrap();
+        writeln!(stdin, "Q").unwrap();
     }
     let out = child.wait_with_output().expect("wait");
 
@@ -401,13 +401,13 @@ fn peer_initiated_key_update_round_trip() {
 
     {
         let mut stdin = child.stdin.take().unwrap();
-        write!(stdin, "BEFORE_PEER_KU\n").unwrap();
+        writeln!(stdin, "BEFORE_PEER_KU").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "k\n").unwrap();
+        writeln!(stdin, "k").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "AFTER_PEER_KU\n").unwrap();
+        writeln!(stdin, "AFTER_PEER_KU").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "Q\n").unwrap();
+        writeln!(stdin, "Q").unwrap();
     }
     let out = child.wait_with_output().expect("wait");
 
@@ -476,14 +476,14 @@ fn peer_requested_key_update_round_trip() {
 
     {
         let mut stdin = child.stdin.take().unwrap();
-        write!(stdin, "BEFORE_REQ_KU\n").unwrap();
+        writeln!(stdin, "BEFORE_REQ_KU").unwrap();
         thread::sleep(Duration::from_millis(200));
         // Uppercase K: KeyUpdate requesting the peer to update too.
-        write!(stdin, "K\n").unwrap();
+        writeln!(stdin, "K").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "AFTER_REQ_KU\n").unwrap();
+        writeln!(stdin, "AFTER_REQ_KU").unwrap();
         thread::sleep(Duration::from_millis(200));
-        write!(stdin, "Q\n").unwrap();
+        writeln!(stdin, "Q").unwrap();
     }
     let out = child.wait_with_output().expect("wait");
 

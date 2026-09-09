@@ -15,4 +15,4 @@ pub use handshake::{HandshakeError, handshake};
 pub use ktls::KtlsSocket;
 pub use probe::ktls_available;
 pub use rustls::pki_types::ServerName;
-pub use stream::{Frame, KtlsMessages};
+pub use stream::{Frame, KtlsMessages, StreamState};

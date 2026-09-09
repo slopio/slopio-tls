@@ -75,7 +75,7 @@ pub fn server_config(settings: ServerSettings) -> Result<Config, rustls::Error> 
     // delay the kTLS switch. Disable them entirely.
     cfg.send_tls13_tickets = 0;
     let alpn_protocols: &'static [&'static [u8]] = match settings.alpn_protocols {
-        Some(list) if list.is_empty() => {
+        Some([]) => {
             return Err(rustls::Error::General(
                 "alpn_protocols was Some but empty; use None to disable ALPN".into(),
             ));
@@ -125,7 +125,7 @@ fn finalize_client_config(
 ) -> Result<ClientConfig, rustls::Error> {
     cfg.enable_secret_extraction = true;
     let alpn_protocols: &'static [&'static [u8]] = match alpn_protocols {
-        Some(list) if list.is_empty() => {
+        Some([]) => {
             return Err(rustls::Error::General(
                 "alpn_protocols was Some but empty; use None to disable ALPN".into(),
             ));

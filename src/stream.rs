@@ -11,7 +11,7 @@ use runtime_streams::Stream;
 use rustls::server::ServerConnectionData;
 
 use crate::ktls::{
-    ControlAction, FATAL_BAD_RECORD_MAC, KEY_UPDATE_NOT_REQUESTED, KtlsSocket, Prelude,
+    CLOSE_NOTIFY, ControlAction, KEY_UPDATE_NOT_REQUESTED, KtlsSocket, Prelude,
     TLS_RECORD_TYPE_ALERT, TLS_RECORD_TYPE_HANDSHAKE,
 };
 
@@ -37,6 +37,22 @@ impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
     }
 }
 
+/// Which directions of the TLS session are still open. See
+/// [`KtlsMessages::state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamState {
+    /// Both directions open.
+    Open,
+    /// We sent `close_notify` (or lost the write side); the peer may still
+    /// send and `next()` keeps yielding.
+    ReadOnly,
+    /// The peer ended its side (`close_notify`, `FIN` or an alert); we may
+    /// still send, and `next()` yields `None`.
+    WriteOnly,
+    /// Both directions closed.
+    Closed,
+}
+
 /// A Stream of decrypted application-data frames over a kTLS-enabled socket.
 ///
 /// Yields [`Frame`] items: kernel-decrypted records (the common case) plus any
@@ -50,11 +66,38 @@ impl<R: BufRingSpec> AsRef<[u8]> for Frame<R> {
 /// - **Peer alert** (close_notify or any other, since TLS 1.3 treats every
 ///   non-close_notify alert as fatal per RFC 8446 §6): the stream ends with
 ///   `None`. No reciprocal alert is sent — the peer initiated the close.
-/// - **Local-side protocol violation** (malformed control record, AEAD
-///   verification failure): a fatal alert is encoded and sent over kTLS via
-///   io_uring before the stream surfaces the error via `Some(Err(_))`. The
-///   alert send is awaited inside `poll_next`, so the caller's `.await`
-///   returns only once the peer has been notified.
+/// - **Local-side protocol violation** (malformed control record): a fatal
+///   alert is sent over kTLS before the stream surfaces `Some(Err(_))`.
+/// - **AEAD verification failure** (`EBADMSG`): no alert can be sent, the
+///   socket is already in error. The stream yields `Some(Err(_))` with
+///   `ErrorKind::InvalidData`, then `None`; the peer sees a TCP RST.
+///
+/// # Session state
+///
+/// [`state`](Self::state) reports which directions are open. `next()` yields
+/// `None` once the peer's side is closed; the send methods fail with
+/// `ErrorKind::NotConnected` once ours is. [`close`](Self::close) closes our
+/// side cleanly (close_notify, then FIN); keep polling `next()` afterwards
+/// until `None` if the protocol expects the peer to finish talking. Dropping
+/// the stream closes the fd without close_notify.
+///
+/// # Key updates
+///
+/// Key updates are the caller's responsibility; nothing here rekeys on a
+/// record-count threshold. The one rule: a record must never be encrypted
+/// under the old key after the KeyUpdate that announces the new one. The
+/// kernel does not enforce it, and with io_uring a send is encrypted when
+/// its SQE runs, not when it is submitted. So do not call a send method, or
+/// [`initiate_key_update`], while a send you dropped before completion may
+/// still be in flight.
+///
+/// KeyUpdates the stream sends itself (a reply to the peer's
+/// `request_update`, or [`initiate_key_update`]) live in the stream, not in
+/// the caller's future: if that future is dropped, the next `send`, `next()`
+/// or `close()` finishes the KeyUpdate and the key rotation before its own
+/// work.
+///
+/// [`initiate_key_update`]: Self::initiate_key_update
 ///
 /// # Truncation detection
 ///
@@ -111,131 +154,54 @@ pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
     ktls: KtlsSocket<S>,
     /// Plaintext decrypted before the recv was armed; the first frame.
     pending: Option<Vec<u8>>,
-    state: State<R>,
+    rx: Rx<R>,
+    tx: Tx,
 }
 
-enum State<R: BufRingSpec> {
-    /// The multishot recv owns the socket's read half while armed; the write
-    /// half stays in `KtlsMessages::ktls` for sends and control records.
+enum Rx<R: BufRingSpec> {
+    /// The multishot recv owns the read half while armed.
     Recving(MultiRecv<R, OwnedReadHalf>),
-    /// A fatal alert is being sent over kTLS in response to a protocol
-    /// violation we detected on the recv side. Once the send completes the
-    /// stream transitions to `Done` and surfaces `err` to the caller.
-    SendingFatal {
-        send: WriteControlRecord<'static>,
+    /// Recv terminated (EIO) while `tx` answers a peer KeyUpdate; re-armed
+    /// once the rotation is done.
+    Paused(OwnedReadHalf),
+    /// A fatal alert is on its way out; `err` is surfaced once it lands.
+    Failing {
+        alert: WriteControlRecord<'static>,
         err: Option<std::io::Error>,
     },
-    /// A peer KeyUpdate asked us to rekey TX (`request_update`). Our own
-    /// KeyUpdate is being sent over kTLS under the old key; once it lands we
-    /// rotate the TX key and resume receiving on `read` (which the terminated
-    /// multishot handed back). The rotation cannot happen before the send:
-    /// the peer must decrypt the announcing record under the old key.
-    SendingKeyUpdate {
-        send: WriteControlRecord<'static>,
-        read: OwnedReadHalf,
-    },
-    Done,
+    Closed,
+}
+
+enum Tx {
+    Idle,
+    /// Our KeyUpdate is in flight under the old key; `rotate_tx_key` follows.
+    Rekeying(WriteControlRecord<'static>),
+    Closed,
 }
 
 impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
 
 impl<S> KtlsSocket<S> {
     pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
-        // No pre-arm drain: the server bounds its handshake reads at the
-        // client's Finished (RX seq 0), and the multishot delivers records
-        // already queued when it arms — including control records, via its
-        // EIO path — so it needs no help. Verified by the `large_pipeline`
-        // and `queued_before_multirecv` tests.
         let Prelude { plaintext, action } = std::mem::take(&mut self.prelude);
-        match action {
-            ControlAction::Continue => KtlsMessages::open(self, plaintext),
-            ControlAction::End => KtlsMessages::closed(self, plaintext),
-            ControlAction::SendFatal { payload, err } => {
-                KtlsMessages::failing(self, plaintext, payload, err)
-            }
-            // The handshake never produces SendKeyUpdate: KeyUpdate is a
-            // post-handshake message, so the prelude action is only ever
-            // Continue, End or SendFatal.
-            ControlAction::SendKeyUpdate => KtlsMessages::open(self, plaintext),
-        }
+        let read_half = self
+            .read_half
+            .take()
+            .expect("read half is only taken by into_messages");
+        let mut stream = KtlsMessages {
+            ktls: self,
+            pending: plaintext,
+            rx: Rx::Closed,
+            tx: Tx::Idle,
+        };
+        // `tx` is Idle here, so `apply` never has an error to hand back.
+        let _ = stream.apply(read_half, action);
+        stream
     }
 }
 
-/// Constructors, crate-private on purpose: building a stream without going
-/// through `into_messages` skips the drain, and the multishot recv silently
-/// drops records already queued when it arms. `drained` is yielded first.
-impl<R: BufRingSpec, S> KtlsMessages<R, S> {
-    /// Session still open: arm the recv.
-    pub(crate) fn open(mut ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
-        let read_half = ktls
-            .read_half
-            .take()
-            .expect("read half is only taken by a KtlsMessages constructor");
-        Self {
-            ktls,
-            pending: drained,
-            state: State::Recving(MultiRecv::new(read_half)),
-        }
-    }
-
-    /// The peer's close_notify was consumed by the handshake or the drain, so
-    /// nothing on the socket will signal it again: no recv is armed. The
-    /// write half keeps the fd open for sends.
-    pub(crate) fn closed(ktls: KtlsSocket<S>, drained: Option<Vec<u8>>) -> Self {
-        Self {
-            ktls,
-            pending: drained,
-            state: State::Done,
-        }
-    }
-
-    /// Violation found while draining: send the fatal alert, then surface `err`.
-    fn failing(
-        ktls: KtlsSocket<S>,
-        drained: Option<Vec<u8>>,
-        payload: &'static [u8; 2],
-        err: std::io::Error,
-    ) -> Self {
-        let send = socket_send_control_record(ktls.as_socket(), TLS_RECORD_TYPE_ALERT, payload);
-        Self {
-            ktls,
-            pending: drained,
-            state: State::SendingFatal {
-                send,
-                err: Some(err),
-            },
-        }
-    }
-
-    /// `read_half` is armed on `Continue`, dropped otherwise.
-    fn next_state(ktls: &KtlsSocket<S>, read_half: OwnedReadHalf, action: ControlAction) -> State<R> {
-        match action {
-            ControlAction::Continue => State::Recving(MultiRecv::new(read_half)),
-            ControlAction::End => State::Done,
-            ControlAction::SendFatal { payload, err } => State::SendingFatal {
-                send: socket_send_control_record(ktls.as_socket(), TLS_RECORD_TYPE_ALERT, payload),
-                err: Some(err),
-            },
-            ControlAction::SendKeyUpdate => State::SendingKeyUpdate {
-                send: socket_send_control_record(
-                    ktls.as_socket(),
-                    TLS_RECORD_TYPE_HANDSHAKE,
-                    &KEY_UPDATE_NOT_REQUESTED,
-                ),
-                read: read_half,
-            },
-        }
-    }
-
-    /// The multishot is dead after any error CQE (e.g. the EIO signalling a
-    /// control record) and the driver never resubmits it: take the read half
-    /// back out and, on `Continue`, arm a fresh one.
-    fn transition(&mut self, action: ControlAction) {
-        let State::Recving(old) = std::mem::replace(&mut self.state, State::Done) else {
-            unreachable!("transition is only called from the Recving arm")
-        };
-        self.state = Self::next_state(&self.ktls, old.into_inner(), action);
-    }
+fn write_closed() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotConnected, "TLS write side closed")
 }
 
 impl<R: BufRingSpec, S> KtlsMessages<R, S> {
@@ -247,19 +213,110 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         self.ktls.tx_records()
     }
 
-    /// Rotate our TX key: send a KeyUpdate over kTLS (async, io_uring — never
-    /// blocks the executor), then install the next sending key. The KeyUpdate
-    /// goes out under the old key, as RFC 8446 §4.6.3 requires, before the
-    /// rotation. Application-initiated; the peer-requested rekey is driven by
-    /// the recv state machine instead.
+    pub fn state(&self) -> StreamState {
+        let rx_open = matches!(self.rx, Rx::Recving(_) | Rx::Paused(_));
+        let tx_open = !matches!(self.tx, Tx::Closed);
+        match (rx_open, tx_open) {
+            (true, true) => StreamState::Open,
+            (true, false) => StreamState::ReadOnly,
+            (false, true) => StreamState::WriteOnly,
+            (false, false) => StreamState::Closed,
+        }
+    }
+
+    /// React to a control record read off the socket. `read` is the read
+    /// half handed back by the terminated multishot. Returns an error to
+    /// surface right away when no alert can be sent.
+    fn apply(&mut self, read: OwnedReadHalf, action: ControlAction) -> Option<std::io::Error> {
+        match action {
+            ControlAction::Continue => self.rx = Rx::Recving(MultiRecv::new(read)),
+            ControlAction::End => self.rx = Rx::Closed,
+            ControlAction::SendFatal { err, .. } if matches!(self.tx, Tx::Closed) => {
+                self.rx = Rx::Closed;
+                return Some(err);
+            }
+            ControlAction::SendFatal { payload, err } => {
+                self.tx = Tx::Closed;
+                self.rx = Rx::Failing {
+                    alert: socket_send_control_record(
+                        self.ktls.as_socket(),
+                        TLS_RECORD_TYPE_ALERT,
+                        payload,
+                    ),
+                    err: Some(err),
+                };
+            }
+            // RX is already rekeyed; after our close_notify we may not reply.
+            ControlAction::SendKeyUpdate if matches!(self.tx, Tx::Closed) => {
+                self.rx = Rx::Recving(MultiRecv::new(read));
+            }
+            ControlAction::SendKeyUpdate => {
+                self.rx = Rx::Paused(read);
+                self.tx = Tx::Rekeying(socket_send_control_record(
+                    self.ktls.as_socket(),
+                    TLS_RECORD_TYPE_HANDSHAKE,
+                    &KEY_UPDATE_NOT_REQUESTED,
+                ));
+            }
+        }
+        None
+    }
+
+    fn poll_rekey(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let Tx::Rekeying(send) = &mut self.tx else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = std::task::ready!(Pin::new(send).poll(cx));
+        self.tx = Tx::Idle;
+        let result = result.and_then(|_| self.ktls.rotate_tx_key());
+        if result.is_err() {
+            self.tx = Tx::Closed;
+        }
+        Poll::Ready(result)
+    }
+
+    /// Finish a KeyUpdate left in flight, then rotate the key.
+    async fn finish_rekey(&mut self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_rekey(cx)).await
+    }
+
+    async fn ready_to_send(&mut self) -> std::io::Result<()> {
+        self.finish_rekey().await?;
+        match self.tx {
+            Tx::Closed => Err(write_closed()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rotate our TX key: send a KeyUpdate over kTLS, then install the next
+    /// sending key. The KeyUpdate goes out under the old key, as RFC 8446
+    /// §4.6.3 requires, before the rotation. Cancel-safe: see the type-level
+    /// "Key updates" section.
     pub async fn initiate_key_update(&mut self) -> std::io::Result<()> {
-        socket_send_control_record(
+        self.ready_to_send().await?;
+        self.tx = Tx::Rekeying(socket_send_control_record(
             self.ktls.as_socket(),
             TLS_RECORD_TYPE_HANDSHAKE,
             &KEY_UPDATE_NOT_REQUESTED,
-        )
-        .await?;
-        self.ktls.rotate_tx_key()
+        ));
+        self.finish_rekey().await
+    }
+
+    /// Close our side: send `close_notify`, then `shutdown(SHUT_WR)`. The
+    /// stream moves to `ReadOnly` (or `Closed` if the peer's side was already
+    /// closed); `next()` keeps working. Idempotent.
+    pub async fn close(&mut self) -> std::io::Result<()> {
+        self.finish_rekey().await?;
+        if matches!(self.tx, Tx::Closed) {
+            return Ok(());
+        }
+        self.tx = Tx::Closed;
+        socket_send_control_record(self.ktls.as_socket(), TLS_RECORD_TYPE_ALERT, &CLOSE_NOTIFY)
+            .await?;
+        if unsafe { libc::shutdown(self.ktls.fd(), libc::SHUT_WR) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Send the entire plaintext buffer over the kTLS socket, looping over
@@ -271,6 +328,9 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     /// `.to_vec()` at the boundary; callers with `&'static [u8]` /
     /// `&'static [u8; N]` can pass them directly (no allocation).
     pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
         let (result, buf) = send_all(self.ktls.as_socket(), buf).await;
         if result.is_ok() {
             self.ktls.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
@@ -288,6 +348,9 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
     /// handed back alongside the result.
     pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), bufs);
+        }
         let (result, bufs) = send_vectored_all(self.ktls.as_socket(), bufs).await;
         if result.is_ok() {
             let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
@@ -298,12 +361,15 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
 
     /// Zero-copy send of a registered (fixed) buffer over the kTLS socket.
     ///
-    /// `buf` comes from a [`FixedSendBufPool`], so the kernel can transmit it
+    /// `buf` comes from the runtime's `FixedSendBufPool`, so the kernel can transmit it
     /// without copying into its own send buffers (`SEND_ZC`). The buffer is
     /// handed back alongside the result for cancel-safety, just like [`send`].
     ///
     /// [`send`]: Self::send
     pub async fn send_fixed_zc(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
         let (result, buf) = socket_write_fixed_zc(self.ktls.as_socket(), buf).await;
         if result.is_ok() {
             self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
@@ -317,6 +383,9 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
     ///
     /// The buffer is handed back alongside the result for cancel-safety.
     pub async fn send_fixed(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
         let (result, buf) = socket_write_fixed(self.ktls.as_socket(), buf).await;
         if result.is_ok() {
             self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
@@ -336,75 +405,59 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
         }
 
         loop {
-            match &mut this.state {
-                State::Done => return Poll::Ready(None),
-                State::SendingFatal { send, err } => match Pin::new(send).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(_) => {
-                        // Best-effort: whether the alert reached the peer or
-                        // not, we always surface the original error and end.
-                        let e = err
-                            .take()
-                            .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
-                        this.state = State::Done;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                },
-                State::SendingKeyUpdate { send, .. } => match Pin::new(send).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(_)) => {
-                        // Our KeyUpdate is on the wire under the old key; now
-                        // rotate TX and resume receiving on the handed-back
-                        // read half.
-                        if let Err(e) = this.ktls.rotate_tx_key() {
-                            this.state = State::Done;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        let State::SendingKeyUpdate { read, .. } =
-                            std::mem::replace(&mut this.state, State::Done)
-                        else {
-                            unreachable!("just matched SendingKeyUpdate")
-                        };
-                        this.state = State::Recving(MultiRecv::new(read));
-                    }
-                    Poll::Ready(Err(e)) => {
-                        this.state = State::Done;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                },
-                State::Recving(recv) => match Pin::new(recv).poll_next(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(None) => {
-                        this.state = State::Done;
+            if let Err(e) = std::task::ready!(this.poll_rekey(cx)) {
+                this.rx = Rx::Closed;
+                return Poll::Ready(Some(Err(e)));
+            }
+            match &mut this.rx {
+                Rx::Closed => return Poll::Ready(None),
+                Rx::Paused(_) => {
+                    let Rx::Paused(read) = std::mem::replace(&mut this.rx, Rx::Closed) else {
+                        unreachable!()
+                    };
+                    this.rx = Rx::Recving(MultiRecv::new(read));
+                }
+                Rx::Failing { alert, err } => {
+                    // Best-effort: the original error is surfaced either way.
+                    let _ = std::task::ready!(Pin::new(alert).poll(cx));
+                    let e = err
+                        .take()
+                        .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
+                    this.rx = Rx::Closed;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Rx::Recving(recv) => match std::task::ready!(Pin::new(recv).poll_next(cx)) {
+                    None => {
+                        this.rx = Rx::Closed;
                         return Poll::Ready(None);
                     }
-                    Poll::Ready(Some(Ok(buf))) => {
-                        return Poll::Ready(Some(Ok(Frame::Borrowed(buf))));
-                    }
-                    Poll::Ready(Some(Err(CompletionError::Other(code)))) if code == -libc::EIO => {
-                        // A control record is waiting; its action picks the
-                        // next state, which the loop then polls.
+                    Some(Ok(buf)) => return Poll::Ready(Some(Ok(Frame::Borrowed(buf)))),
+                    Some(Err(CompletionError::Other(code))) if code == -libc::EIO => {
+                        let Rx::Recving(old) = std::mem::replace(&mut this.rx, Rx::Closed) else {
+                            unreachable!()
+                        };
+                        let read = old.into_inner();
                         match this.ktls.handle_control_record() {
-                            Ok(action) => this.transition(action),
-                            Err(e) => {
-                                this.state = State::Done;
-                                return Poll::Ready(Some(Err(e)));
+                            Ok(action) => {
+                                if let Some(e) = this.apply(read, action) {
+                                    return Poll::Ready(Some(Err(e)));
+                                }
                             }
+                            Err(e) => return Poll::Ready(Some(Err(e))),
                         }
                     }
-                    Poll::Ready(Some(Err(CompletionError::Other(code))))
-                        if code == -libc::EBADMSG =>
-                    {
-                        // AEAD verification failure: the kernel discarded a
-                        // record we couldn't decrypt. Notify the peer with
-                        // a `bad_record_mac` fatal alert (RFC 8446 §6).
-                        this.transition(ControlAction::SendFatal {
-                            payload: &FATAL_BAD_RECORD_MAC,
-                            err: std::io::Error::from_raw_os_error(libc::EBADMSG),
-                        });
+                    Some(Err(CompletionError::Other(code))) if code == -libc::EBADMSG => {
+                        // AEAD failure: kTLS set sk_err, so no alert can be sent.
+                        this.rx = Rx::Closed;
+                        this.tx = Tx::Closed;
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "kTLS: record failed AEAD verification (EBADMSG)",
+                        ))));
                     }
-                    Poll::Ready(Some(Err(e))) => {
-                        this.state = State::Done;
+                    Some(Err(e)) => {
+                        this.rx = Rx::Closed;
+                        this.tx = Tx::Closed;
                         return Poll::Ready(Some(Err(completion_to_io(e))));
                     }
                 },

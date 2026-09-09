@@ -36,7 +36,7 @@ impl std::fmt::Display for HandshakeError {
                 write!(f, "unexpected TLS state during handshake: {name}")
             }
             HandshakeError::LeftoverBytes => {
-                f.write_str("leftover bytes after handshake could not be processed")
+                f.write_str("handshake record buffer full without a complete record")
             }
             HandshakeError::Timeout => f.write_str("handshake timed out"),
         }
@@ -356,82 +356,6 @@ fn scan(buf: &[u8]) -> Scan {
     }
 }
 
-#[cfg(test)]
-mod scan_tests {
-    use super::{MAX_TLS_CIPHERTEXT, Scan, scan};
-
-    /// Build a TLS record: 5-byte header (type, legacy version, length) + body.
-    fn record(content_type: u8, body_len: usize) -> Vec<u8> {
-        let mut r = vec![content_type, 0x03, 0x03];
-        r.extend_from_slice(&(body_len as u16).to_be_bytes());
-        r.extend(std::iter::repeat_n(0u8, body_len));
-        r
-    }
-
-    const CCS: u8 = 20;
-    const APPDATA: u8 = 23; // encrypted handshake (Finished) or app data on the wire
-
-    #[test]
-    fn empty_is_more() {
-        assert!(matches!(scan(&[]), Scan::More));
-    }
-
-    #[test]
-    fn partial_header_is_more() {
-        assert!(matches!(scan(&[APPDATA, 0x03, 0x03]), Scan::More));
-    }
-
-    #[test]
-    fn ccs_alone_is_more() {
-        // A complete ChangeCipherSpec with no Finished yet: keep reading.
-        assert!(matches!(scan(&record(CCS, 1)), Scan::More));
-    }
-
-    #[test]
-    fn ccs_then_finished_stops_at_finished_end() {
-        let mut buf = record(CCS, 1);
-        let ccs_end = buf.len();
-        buf.extend(record(APPDATA, 40));
-        match scan(&buf) {
-            Scan::Finished(n) => assert_eq!(n, ccs_end + 5 + 40),
-            other => panic!("expected Finished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn finished_without_ccs() {
-        let buf = record(APPDATA, 40);
-        assert!(matches!(scan(&buf), Scan::Finished(n) if n == 45));
-    }
-
-    #[test]
-    fn app_data_after_finished_is_left_out() {
-        // Finished then a pipelined request, both type 23. scan must stop at
-        // the FIRST one so the request stays queued for the kernel.
-        let finished = record(APPDATA, 40);
-        let finished_end = finished.len();
-        let mut buf = finished;
-        buf.extend(record(APPDATA, 500)); // the request
-        assert!(matches!(scan(&buf), Scan::Finished(n) if n == finished_end));
-    }
-
-    #[test]
-    fn partial_finished_is_more() {
-        // CCS complete, Finished header present but body truncated.
-        let mut buf = record(CCS, 1);
-        buf.extend(record(APPDATA, 40));
-        buf.truncate(buf.len() - 10); // chop the Finished body
-        assert!(matches!(scan(&buf), Scan::More));
-    }
-
-    #[test]
-    fn oversized_length_is_malformed() {
-        let mut buf = vec![APPDATA, 0x03, 0x03];
-        buf.extend_from_slice(&((MAX_TLS_CIPHERTEXT as u16 + 1)).to_be_bytes());
-        assert!(matches!(scan(&buf), Scan::Malformed));
-    }
-}
-
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -516,11 +440,10 @@ async fn drain_pending_alert<C: UnbufferedDriver>(
 ) {
     let UnbufferedStatus { state, .. } = conn.step(&mut in_buf[..filled]);
     let mut len = pending;
-    if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state {
-        if let Ok(n) = enc.encode(&mut out_buf[pending..]) {
+    if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state
+        && let Ok(n) = enc.encode(&mut out_buf[pending..]) {
             len += n;
         }
-    }
     if len > 0 {
         let _ = send_all(socket, out_buf, len).await;
     }
@@ -541,4 +464,80 @@ async fn send_all(
     let slice = out_buf.slice(0..len);
     let (result, slice) = runtime_send_all(socket, slice).await;
     (result.map_err(HandshakeError::Io), slice.into_inner())
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::{MAX_TLS_CIPHERTEXT, Scan, scan};
+
+    /// Build a TLS record: 5-byte header (type, legacy version, length) + body.
+    fn record(content_type: u8, body_len: usize) -> Vec<u8> {
+        let mut r = vec![content_type, 0x03, 0x03];
+        r.extend_from_slice(&(body_len as u16).to_be_bytes());
+        r.extend(std::iter::repeat_n(0u8, body_len));
+        r
+    }
+
+    const CCS: u8 = 20;
+    const APPDATA: u8 = 23; // encrypted handshake (Finished) or app data on the wire
+
+    #[test]
+    fn empty_is_more() {
+        assert!(matches!(scan(&[]), Scan::More));
+    }
+
+    #[test]
+    fn partial_header_is_more() {
+        assert!(matches!(scan(&[APPDATA, 0x03, 0x03]), Scan::More));
+    }
+
+    #[test]
+    fn ccs_alone_is_more() {
+        // A complete ChangeCipherSpec with no Finished yet: keep reading.
+        assert!(matches!(scan(&record(CCS, 1)), Scan::More));
+    }
+
+    #[test]
+    fn ccs_then_finished_stops_at_finished_end() {
+        let mut buf = record(CCS, 1);
+        let ccs_end = buf.len();
+        buf.extend(record(APPDATA, 40));
+        match scan(&buf) {
+            Scan::Finished(n) => assert_eq!(n, ccs_end + 5 + 40),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finished_without_ccs() {
+        let buf = record(APPDATA, 40);
+        assert!(matches!(scan(&buf), Scan::Finished(n) if n == 45));
+    }
+
+    #[test]
+    fn app_data_after_finished_is_left_out() {
+        // Finished then a pipelined request, both type 23. scan must stop at
+        // the FIRST one so the request stays queued for the kernel.
+        let finished = record(APPDATA, 40);
+        let finished_end = finished.len();
+        let mut buf = finished;
+        buf.extend(record(APPDATA, 500)); // the request
+        assert!(matches!(scan(&buf), Scan::Finished(n) if n == finished_end));
+    }
+
+    #[test]
+    fn partial_finished_is_more() {
+        // CCS complete, Finished header present but body truncated.
+        let mut buf = record(CCS, 1);
+        buf.extend(record(APPDATA, 40));
+        buf.truncate(buf.len() - 10); // chop the Finished body
+        assert!(matches!(scan(&buf), Scan::More));
+    }
+
+    #[test]
+    fn oversized_length_is_malformed() {
+        let mut buf = vec![APPDATA, 0x03, 0x03];
+        buf.extend_from_slice(&(MAX_TLS_CIPHERTEXT as u16 + 1).to_be_bytes());
+        assert!(matches!(scan(&buf), Scan::Malformed));
+    }
 }

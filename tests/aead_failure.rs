@@ -18,8 +18,8 @@
 //! segment as Finished.
 //!
 //! Once the corrupted record reaches the kernel, kTLS recv yields
-//! `EBADMSG`, the stream transitions into `State::SendingFatal`, emits
-//! a `bad_record_mac` alert, and finally surfaces `Err(EBADMSG)`.
+//! `EBADMSG` and the stream surfaces `Err(InvalidData)` then `None`. No
+//! alert is sent: kTLS has already put the socket in error.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -154,6 +154,7 @@ fn aead_corruption_triggers_fatal_alert() {
                 ),
                 None => panic!("stream ended before AEAD failure surfaced"),
             }
+            assert!(stream.next().await.is_none(), "stream must end after the error");
         });
     });
 
@@ -230,9 +231,9 @@ fn aead_corruption_triggers_fatal_alert() {
         .recv()
         .expect("server thread should report an error");
     assert_eq!(
-        err.raw_os_error(),
-        Some(libc::EBADMSG),
-        "expected EBADMSG from kTLS, got {err:?}"
+        err.kind(),
+        std::io::ErrorKind::InvalidData,
+        "expected InvalidData from kTLS EBADMSG, got {err:?}"
     );
 
     client.join().expect("client thread");

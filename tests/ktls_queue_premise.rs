@@ -1,19 +1,19 @@
 //! Decisive experiment: does kTLS RX reprocess ciphertext that was **already
 //! sitting in the TCP receive queue** at the moment `TLS_RX` is attached?
 //!
-//! This is the premise the whole handshake-exit drain rests on. Our code
-//! drains every queued record through rustls *before* `setsockopt(TLS_RX)`
-//! because we assumed the kernel cannot see pre-attach skbs. These tests
-//! settle it directly, with no rustls / io_uring in the way — just loopback
-//! TCP sockets and the kernel TLS ULP driven via `libc`.
+//! This is the premise the handshake exit rests on: the server stops its
+//! reads at the client's Finished and lets the kernel deliver whatever was
+//! already queued. These tests settle it directly, with no rustls / io_uring
+//! in the way — just loopback TCP sockets and the kernel TLS ULP driven via
+//! `libc`.
 //!
 //! Cases:
-//!   * `control_rx_before_data`            — RX attached first (sanity: proves
-//!                                            our hand-built crypto_info works).
-//!   * `premise_single_record_queued`      — one full record queued, then RX.
-//!   * `premise_multiple_records_queued`   — two full records queued, then RX.
-//!   * `premise_record_fragmented_across_attach` — half a record queued, RX
-//!                                            attached, then the tail sent.
+//! * `control_rx_before_data`: RX attached first (sanity: proves our
+//!   hand-built crypto_info works).
+//! * `premise_single_record_queued`: one full record queued, then RX.
+//! * `premise_multiple_records_queued`: two full records queued, then RX.
+//! * `premise_record_fragmented_across_attach`: half a record queued, RX
+//!   attached, then the tail sent.
 //!
 //! Run with output:  cargo test --test ktls_queue_premise -- --nocapture
 

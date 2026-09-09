@@ -345,8 +345,8 @@ pub(crate) static KEY_UPDATE_NOT_REQUESTED: [u8; 5] = [HANDSHAKE_KEY_UPDATE, 0, 
 // RFC 8446 §6 fatal alert payloads. Static so the async send future can
 // borrow them with a `'static` lifetime and live in the `KtlsMessages`
 // state machine without a self-referential struct.
+pub(crate) static CLOSE_NOTIFY: [u8; 2] = [1, 0];
 pub(crate) static FATAL_UNEXPECTED_MESSAGE: [u8; 2] = [2, 10];
-pub(crate) static FATAL_BAD_RECORD_MAC: [u8; 2] = [2, 20];
 pub(crate) static FATAL_ILLEGAL_PARAMETER: [u8; 2] = [2, 47];
 pub(crate) static FATAL_DECODE_ERROR: [u8; 2] = [2, 50];
 
