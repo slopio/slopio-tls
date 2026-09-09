@@ -163,7 +163,11 @@ fn pipelined_magic_then_separate_settings() {
                         // immediately SEND a reply before reading the next
                         // frame — exercising the read→send→read interleave.
                         first = false;
-                        stream.send(b"server-preface".to_vec()).await.0.expect("send reply");
+                        stream
+                            .send(b"server-preface".to_vec())
+                            .await
+                            .0
+                            .expect("send reply");
                     }
                     if got.len() >= MAGIC.len() + SETTINGS.len() {
                         break;
@@ -242,7 +246,8 @@ fn pipelined_magic_then_separate_settings() {
     proxy.join().expect("proxy thread");
 
     assert_eq!(
-        got, expected,
+        got,
+        expected,
         "\nLOST DATA: server got {} bytes, expected {}.\n got     = {:?}\n expected= {:?}",
         got.len(),
         expected.len(),

@@ -296,7 +296,10 @@ fn server_initiated_key_update_round_trip() {
 
             let mut stream = ktls.into_messages::<MediumRing>();
             stream.send(b"before").await.0.expect("send before");
-            stream.initiate_key_update().await.expect("initiate_key_update");
+            stream
+                .initiate_key_update()
+                .await
+                .expect("initiate_key_update");
             stream.send(b"after").await.0.expect("send after");
         });
     });

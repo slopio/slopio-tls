@@ -111,11 +111,7 @@ fn echo_round_trip() {
                 .await
                 .expect("handshake");
             let mut stream = ktls.into_messages::<MediumRing>();
-            let frame = stream
-                .next()
-                .await
-                .expect("stream ended")
-                .expect("recv");
+            let frame = stream.next().await.expect("stream ended").expect("recv");
             stream.send(frame.as_ref().to_vec()).await.0.expect("send");
             // dropping stream here sends close_notify and closes the socket;
             // openssl client sees the close and exits.
@@ -527,14 +523,21 @@ fn server_initiated_key_update_round_trip() {
                 "tx_records should have incremented after first send"
             );
 
-            stream.initiate_key_update().await.expect("initiate_key_update");
+            stream
+                .initiate_key_update()
+                .await
+                .expect("initiate_key_update");
             assert_eq!(
                 stream.tx_records(),
                 0,
                 "tx_records should reset to 0 after key update"
             );
 
-            stream.send(b"AFTER_ROTATION\n").await.0.expect("send after");
+            stream
+                .send(b"AFTER_ROTATION\n")
+                .await
+                .0
+                .expect("send after");
             assert!(
                 stream.tx_records() > 0,
                 "tx_records should increment again after post-rotation send"

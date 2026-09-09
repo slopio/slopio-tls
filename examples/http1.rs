@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use runtime::main_thread_with;
 use runtime::net::MultiAccept;
 use runtime_streams::StreamExt;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
@@ -58,8 +58,7 @@ fn main() {
 }
 
 fn self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let mut params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
     params.distinguished_name = rcgen::DistinguishedName::new();
     let key = KeyPair::generate().expect("keypair");
     let cert = params.self_signed(&key).expect("self sign");

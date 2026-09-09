@@ -87,7 +87,11 @@ impl PooledBuf {
             offset <= end && end <= self.len(),
             "window [{offset}, {end}) out of pool buffer bounds"
         );
-        PooledTail { buf: self, offset, end }
+        PooledTail {
+            buf: self,
+            offset,
+            end,
+        }
     }
 
     /// `window(offset, len)`: everything from `offset` to the end.

@@ -15,10 +15,7 @@ use crate::ktls::KtlsSocket;
 
 impl UnbufferedDriver for UnbufferedClientConnection {
     type Data = ClientConnectionData;
-    fn step<'c, 'i>(
-        &'c mut self,
-        in_buf: &'i mut [u8],
-    ) -> UnbufferedStatus<'c, 'i, Self::Data> {
+    fn step<'c, 'i>(&'c mut self, in_buf: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data> {
         self.process_tls_records(in_buf)
     }
     fn negotiated_alpn(&self) -> Option<&[u8]> {

@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use runtime::net::{
-    IoBuf, SocketWrapper, send_all as runtime_send_all, socket_peek, socket_recv,
-};
+use runtime::net::{IoBuf, SocketWrapper, send_all as runtime_send_all, socket_peek, socket_recv};
 use runtime::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::kernel::KernelConnection;
@@ -441,9 +439,10 @@ async fn drain_pending_alert<C: UnbufferedDriver>(
     let UnbufferedStatus { state, .. } = conn.step(&mut in_buf[..filled]);
     let mut len = pending;
     if let Ok(ConnectionState::EncodeTlsData(mut enc)) = state
-        && let Ok(n) = enc.encode(&mut out_buf[pending..]) {
-            len += n;
-        }
+        && let Ok(n) = enc.encode(&mut out_buf[pending..])
+    {
+        len += n;
+    }
     if len > 0 {
         let _ = send_all(socket, out_buf, len).await;
     }

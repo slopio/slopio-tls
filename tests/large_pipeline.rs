@@ -201,6 +201,14 @@ fn large_pipeline_to_client_arrives_intact() {
     server.join().unwrap();
     client.join().unwrap();
 
-    assert_eq!(got.len(), PAYLOAD_LEN, "client received {} bytes", got.len());
-    assert!(got == payload(), "payload mismatch on the client receive side");
+    assert_eq!(
+        got.len(),
+        PAYLOAD_LEN,
+        "client received {} bytes",
+        got.len()
+    );
+    assert!(
+        got == payload(),
+        "payload mismatch on the client receive side"
+    );
 }

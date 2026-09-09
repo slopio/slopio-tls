@@ -1,11 +1,5 @@
 pub fn ktls_available() -> bool {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return false;
     }
@@ -20,7 +14,9 @@ pub fn ktls_available() -> bool {
         )
     };
     let err = std::io::Error::last_os_error();
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     if ret == 0 {
         return true;
     }
@@ -31,6 +27,9 @@ pub fn ktls_available() -> bool {
 mod tests {
     #[test]
     fn ktls_is_available_on_this_system() {
-        assert!(super::ktls_available(), "kTLS must be available for tests to run");
+        assert!(
+            super::ktls_available(),
+            "kTLS must be available for tests to run"
+        );
     }
 }

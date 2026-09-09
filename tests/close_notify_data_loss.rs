@@ -86,7 +86,11 @@ fn send_record(fd: i32, record_type: u8, payload: &[u8]) {
     msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
     msg.msg_controllen = size_of::<TlsCmsg>() as _;
     let n = unsafe { libc::sendmsg(fd, &msg, 0) };
-    assert!(n >= 0, "sendmsg failed: {}", std::io::Error::last_os_error());
+    assert!(
+        n >= 0,
+        "sendmsg failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[test]
@@ -156,7 +160,8 @@ fn data_record_before_close_notify_is_not_lost() {
     server.join().unwrap();
 
     assert_eq!(
-        got, b"PAYLOAD-BEFORE-CLOSE",
+        got,
+        b"PAYLOAD-BEFORE-CLOSE",
         "\nDATA LOST: the app-data record before close_notify was dropped. got={:?}",
         String::from_utf8_lossy(&got)
     );

@@ -1,9 +1,7 @@
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-use popple_tls::{
-    ServerName, client_config_dangerous_no_verification, connect, ktls_available,
-};
+use popple_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
 use runtime::main_thread_with;
 use runtime_streams::StreamExt;
 
@@ -19,7 +17,9 @@ fn main() {
         .install_default()
         .expect("install default crypto provider");
 
-    let host = std::env::args().nth(1).unwrap_or_else(|| "example.com".into());
+    let host = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "example.com".into());
     let port: u16 = 443;
 
     // DNS lookup is sync — fine for a one-shot example.
@@ -30,8 +30,8 @@ fn main() {
         .expect("no addrs");
     println!("resolved {host} -> {addr}");
 
-    let config = client_config_dangerous_no_verification(Some(&[b"http/1.1"]))
-        .expect("client config");
+    let config =
+        client_config_dangerous_no_verification(Some(&[b"http/1.1"])).expect("client config");
 
     main_thread_with::<MediumRing, _>(async move {
         let server_name = ServerName::try_from(host.clone()).expect("server name");
@@ -44,7 +44,8 @@ fn main() {
         };
         println!(
             "handshake done, ALPN = {:?}",
-            ktls.alpn().map(|p| std::str::from_utf8(p).unwrap_or("<bin>"))
+            ktls.alpn()
+                .map(|p| std::str::from_utf8(p).unwrap_or("<bin>"))
         );
 
         let req = format!(
@@ -64,7 +65,8 @@ fn main() {
                     if first_chunk {
                         // Print just the response headers so the example output is short.
                         let text = String::from_utf8_lossy(data);
-                        let headers_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+                        let headers_end =
+                            text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
                         print!("{}", &text[..headers_end]);
                         first_chunk = false;
                     }

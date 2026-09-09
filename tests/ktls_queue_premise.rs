@@ -291,9 +291,9 @@ fn premise_queued_record_at_nonzero_seq() {
     let res = read_decrypted(&mut b, 19);
     eprintln!("\n================= VERDICT (non-zero seq) =================");
     match &res {
-        Ok(v) if v == b"settings-at-seq-one" => eprintln!(
-            "RECOVERED — kTLS applies rec_seq=1 to the queued record. Not the bug."
-        ),
+        Ok(v) if v == b"settings-at-seq-one" => {
+            eprintln!("RECOVERED — kTLS applies rec_seq=1 to the queued record. Not the bug.")
+        }
         Ok(v) => eprintln!(
             "MISMATCH ({} bytes) -> THIS is the bug: queued data at non-zero seq is\n\
              mishandled. {:?}",

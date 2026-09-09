@@ -116,7 +116,8 @@ fn multirecv_picks_up_record_queued_before_arming() {
     server.join().unwrap();
 
     assert_eq!(
-        got, b"HELLO",
+        got,
+        b"HELLO",
         "\nMultiRecv missed a record queued before it armed: got {:?}",
         String::from_utf8_lossy(&got)
     );

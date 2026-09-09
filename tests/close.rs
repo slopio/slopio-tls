@@ -83,9 +83,20 @@ fn close_notify_half_close_round_trip() {
                 "send after close must fail"
             );
 
-            let bye = stream.next().await.expect("frame after our close").expect("bye ok");
-            assert_eq!(bye.as_ref(), b"bye", "read side must stay open after close()");
-            assert!(stream.next().await.is_none(), "peer close_notify ends the stream");
+            let bye = stream
+                .next()
+                .await
+                .expect("frame after our close")
+                .expect("bye ok");
+            assert_eq!(
+                bye.as_ref(),
+                b"bye",
+                "read side must stay open after close()"
+            );
+            assert!(
+                stream.next().await.is_none(),
+                "peer close_notify ends the stream"
+            );
             assert_eq!(stream.state(), StreamState::Closed);
         });
     });
@@ -110,7 +121,10 @@ fn close_notify_half_close_round_trip() {
             let reply = stream.next().await.expect("reply").expect("reply ok");
             assert_eq!(reply.as_ref(), b"pong");
 
-            assert!(stream.next().await.is_none(), "server close_notify ends the stream");
+            assert!(
+                stream.next().await.is_none(),
+                "server close_notify ends the stream"
+            );
             assert_eq!(stream.state(), StreamState::WriteOnly);
             stream.send(b"bye").await.0.expect("send after peer close");
             stream.close().await.expect("client close");

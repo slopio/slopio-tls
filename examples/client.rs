@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use popple_tls::{
-    ServerName, client_config_dangerous_no_verification, connect, ktls_available,
-};
+use popple_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
 use runtime::main_thread_with;
 use runtime_streams::StreamExt;
 

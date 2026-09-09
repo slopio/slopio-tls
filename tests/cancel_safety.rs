@@ -15,8 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use popple_tls::{
-    ServerName, ServerSettings, client_config_dangerous_no_verification, connect, handshake,
-    server_config, Config,
+    Config, ServerName, ServerSettings, client_config_dangerous_no_verification, connect,
+    handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread_with;
@@ -145,5 +145,8 @@ fn next_is_cancel_safe_under_select() {
         String::from_utf8_lossy(&got),
         String::from_utf8_lossy(&expected),
     );
-    assert_eq!(got, expected, "records arrived but out of order / corrupted");
+    assert_eq!(
+        got, expected,
+        "records arrived but out of order / corrupted"
+    );
 }

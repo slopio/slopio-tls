@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use popple_tls::{ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use runtime::net::SocketWrapper;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
@@ -33,9 +33,24 @@ fn main() {
     let f_handshake = handshake(dummy_sock, cfg.clone(), Duration::from_secs(1));
     println!("handshake future: {} B", fsize(f_handshake));
 
-    println!("UnbufferedServerConnection: {} B", std::mem::size_of::<rustls::server::UnbufferedServerConnection>());
-    println!("Arc<rustls::ServerConfig>:  {} B", std::mem::size_of::<std::sync::Arc<rustls::ServerConfig>>());
-    println!("popple_tls::Config:         {} B", std::mem::size_of::<popple_tls::Config>());
-    println!("popple_tls::KtlsSocket:     {} B", std::mem::size_of::<popple_tls::KtlsSocket>());
-    println!("popple_tls::KtlsMessages:   {} B", std::mem::size_of::<popple_tls::KtlsMessages<MediumRing>>());
+    println!(
+        "UnbufferedServerConnection: {} B",
+        std::mem::size_of::<rustls::server::UnbufferedServerConnection>()
+    );
+    println!(
+        "Arc<rustls::ServerConfig>:  {} B",
+        std::mem::size_of::<std::sync::Arc<rustls::ServerConfig>>()
+    );
+    println!(
+        "popple_tls::Config:         {} B",
+        std::mem::size_of::<popple_tls::Config>()
+    );
+    println!(
+        "popple_tls::KtlsSocket:     {} B",
+        std::mem::size_of::<popple_tls::KtlsSocket>()
+    );
+    println!(
+        "popple_tls::KtlsMessages:   {} B",
+        std::mem::size_of::<popple_tls::KtlsMessages<MediumRing>>()
+    );
 }

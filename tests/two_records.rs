@@ -131,7 +131,8 @@ fn two_separate_records_both_delivered() {
     server.join().expect("server thread");
 
     assert_eq!(
-        got, expected,
+        got,
+        expected,
         "\nLOST DATA: server got {} bytes, expected {} (magic={}, settings={}).\n\
          got     = {:?}\nexpected= {:?}",
         got.len(),

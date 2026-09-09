@@ -154,7 +154,10 @@ fn aead_corruption_triggers_fatal_alert() {
                 ),
                 None => panic!("stream ended before AEAD failure surfaced"),
             }
-            assert!(stream.next().await.is_none(), "stream must end after the error");
+            assert!(
+                stream.next().await.is_none(),
+                "stream must end after the error"
+            );
         });
     });
 
@@ -211,11 +214,7 @@ fn aead_corruption_triggers_fatal_alert() {
             .expect("client connect");
 
             let mut stream = ktls.into_messages::<MediumRing>();
-            let ready = stream
-                .next()
-                .await
-                .expect("ready frame")
-                .expect("ready ok");
+            let ready = stream.next().await.expect("ready frame").expect("ready ok");
             assert_eq!(ready.as_ref(), b"ready");
             let _ = stream.send(b"payload that will be tampered").await;
             // Drain whatever the peer surfaces (fatal alert → End, or FIN

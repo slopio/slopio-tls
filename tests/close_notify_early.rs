@@ -98,7 +98,11 @@ fn send_record(fd: i32, record_type: u8, payload: &[u8]) {
     msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
     msg.msg_controllen = size_of::<TlsCmsg>() as _;
     let n = unsafe { libc::sendmsg(fd, &msg, 0) };
-    assert!(n >= 0, "sendmsg failed: {}", std::io::Error::last_os_error());
+    assert!(
+        n >= 0,
+        "sendmsg failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Timing 1: request + close_notify are already in the kernel queue when the
@@ -232,11 +236,9 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
         let cfg = client_config_dangerous_no_verification(None).expect("client config");
         let rustls_cfg: Arc<rustls::ClientConfig> = cfg.rustls;
         let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
-        let mut conn = rustls::ClientConnection::new(
-            rustls_cfg,
-            ServerName::try_from("localhost").unwrap(),
-        )
-        .expect("client conn");
+        let mut conn =
+            rustls::ClientConnection::new(rustls_cfg, ServerName::try_from("localhost").unwrap())
+                .expect("client conn");
 
         // ClientHello goes out on its own.
         while conn.wants_write() {
@@ -283,5 +285,8 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
     server.join().unwrap();
 
     outcome.unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(response, RESPONSE, "client did not get the reply to its pipelined request");
+    assert_eq!(
+        response, RESPONSE,
+        "client did not get the reply to its pipelined request"
+    );
 }

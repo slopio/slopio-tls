@@ -105,8 +105,7 @@ impl EchoServer {
                     }
                     let cfg = cfg.clone();
                     runtime::spawn(async move {
-                        let Ok(ktls) = handshake(socket, cfg, Duration::from_secs(5)).await
-                        else {
+                        let Ok(ktls) = handshake(socket, cfg, Duration::from_secs(5)).await else {
                             return;
                         };
                         let mut stream = ktls.into_messages::<MediumRing>();
