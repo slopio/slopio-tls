@@ -35,7 +35,7 @@ fn main() {
 
     main_thread_with::<MediumRing, _>(async move {
         let server_name = ServerName::try_from(host.clone()).expect("server name");
-        let ktls = match connect(addr, server_name, config, Duration::from_secs(10)).await {
+        let ktls = match connect(addr, server_name, config, Duration::from_secs(5)).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("connect failed: {e}");

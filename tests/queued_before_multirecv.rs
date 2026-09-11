@@ -76,7 +76,7 @@ fn multirecv_picks_up_record_queued_before_arming() {
             let mut stream = ktls.into_messages::<MediumRing>();
 
             let mut got = Vec::new();
-            let collected = timeout(Duration::from_secs(3), async {
+            let collected = timeout(Duration::from_secs(5), async {
                 while let Some(frame) = stream.next().await {
                     got.extend_from_slice(frame.expect("frame ok").as_ref());
                     if got.len() >= 5 {

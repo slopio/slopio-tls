@@ -87,7 +87,7 @@ fn large_pipeline_after_finished_arrives_intact() {
             Sleep::during(Duration::from_millis(200)).await;
             let mut stream = ktls.into_messages::<MediumRing>();
             let mut got = Vec::with_capacity(PAYLOAD_LEN);
-            let _ = timeout(Duration::from_secs(10), async {
+            let _ = timeout(Duration::from_secs(5), async {
                 while got.len() < PAYLOAD_LEN {
                     match stream.next().await {
                         Some(Ok(frame)) => got.extend_from_slice(frame.as_ref()),
@@ -119,7 +119,7 @@ fn large_pipeline_after_finished_arrives_intact() {
             let (res, _) = stream.send(payload()).await;
             res.expect("client send");
             // Hold the connection open until the server has read everything.
-            Sleep::during(Duration::from_secs(3)).await;
+            Sleep::during(Duration::from_secs(1)).await;
         });
     });
 
@@ -163,7 +163,7 @@ fn large_pipeline_to_client_arrives_intact() {
             // Send immediately, while the client is still in its pre-arm sleep.
             let (res, _) = stream.send(payload()).await;
             res.expect("server send");
-            Sleep::during(Duration::from_secs(3)).await;
+            Sleep::during(Duration::from_secs(1)).await;
         });
     });
     ready_rx.recv().unwrap();
@@ -184,7 +184,7 @@ fn large_pipeline_to_client_arrives_intact() {
             Sleep::during(Duration::from_millis(200)).await;
             let mut stream = ktls.into_messages::<MediumRing>();
             let mut got = Vec::with_capacity(PAYLOAD_LEN);
-            let _ = timeout(Duration::from_secs(10), async {
+            let _ = timeout(Duration::from_secs(5), async {
                 while got.len() < PAYLOAD_LEN {
                     match stream.next().await {
                         Some(Ok(frame)) => got.extend_from_slice(frame.as_ref()),

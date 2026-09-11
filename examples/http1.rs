@@ -36,7 +36,7 @@ fn main() {
         let mut acceptor = MultiAccept::new(9092).expect("bind 9092");
         while let Some(socket) = acceptor.next().await {
             let cfg = config.clone();
-            match handshake(socket, cfg, Duration::from_secs(10)).await {
+            match handshake(socket, cfg, Duration::from_secs(5)).await {
                 Ok(ktls) => {
                     let alpn = ktls
                         .alpn()

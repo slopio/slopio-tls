@@ -127,7 +127,9 @@ fn drained_close_notify_ends_stream_without_tcp_fin() {
             Sleep::during(Duration::from_millis(250)).await;
             let mut stream = ktls.into_messages::<MediumRing>();
             let mut got = Vec::new();
-            let ended = timeout(Duration::from_secs(2), async {
+            // Fires well inside the client's 5s hold: a hang is caught here,
+            // while the connection is still open.
+            let ended = timeout(Duration::from_secs(1), async {
                 while let Some(frame) = stream.next().await {
                     match frame {
                         Ok(f) => got.extend_from_slice(f.as_ref()),
@@ -161,7 +163,7 @@ fn drained_close_notify_ends_stream_without_tcp_fin() {
             send_record(fd, TLS_RECORD_TYPE_ALERT, &[1, 0]); // close_notify
             // Keep the TCP connection open well past the server's timeout:
             // the stream must end on the alert alone, not on FIN.
-            Sleep::during(Duration::from_secs(4)).await;
+            Sleep::during(Duration::from_secs(5)).await;
             drop(ktls);
         });
     });
@@ -204,7 +206,7 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
                 // not the handshake — the contract is the observable sequence
                 // below: the request frame, then `None`, with TX still usable.
                 let mut stream = ktls.into_messages::<MediumRing>();
-                let first = timeout(Duration::from_secs(2), stream.next())
+                let first = timeout(Duration::from_secs(5), stream.next())
                     .await
                     .map_err(|_| "hung waiting for the first frame".to_string())?
                     .ok_or("stream ended before delivering the request")?
@@ -212,7 +214,7 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
                 if first.as_ref() != REQUEST {
                     return Err(format!("wrong request: {:?}", first.as_ref()));
                 }
-                let end = timeout(Duration::from_secs(2), stream.next())
+                let end = timeout(Duration::from_secs(5), stream.next())
                     .await
                     .map_err(|_| "hung after the request instead of yielding None".to_string())?;
                 if end.is_some() {

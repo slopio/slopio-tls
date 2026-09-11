@@ -114,7 +114,7 @@ fn data_record_before_close_notify_is_not_lost() {
             Sleep::during(Duration::from_millis(250)).await;
             let mut stream = ktls.into_messages::<MediumRing>();
             let mut got = Vec::new();
-            let collected = timeout(Duration::from_secs(3), async {
+            let collected = timeout(Duration::from_secs(5), async {
                 while let Some(frame) = stream.next().await {
                     match frame {
                         Ok(f) => got.extend_from_slice(f.as_ref()),

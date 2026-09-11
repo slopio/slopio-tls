@@ -154,7 +154,7 @@ fn echo_round_trip() {
 fn handshake_times_out_on_silent_peer() {
     init_provider();
     let port = pick_port();
-    let timeout_ms: u64 = 2000;
+    let timeout_ms: u64 = 1000;
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server = thread::spawn(move || {

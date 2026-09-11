@@ -36,7 +36,7 @@ fn main() {
         let mut acceptor = MultiAccept::new(9091).expect("bind 9091");
         while let Some(socket) = acceptor.next().await {
             let cfg = config.clone();
-            match handshake(socket, cfg, Duration::from_secs(10)).await {
+            match handshake(socket, cfg, Duration::from_secs(5)).await {
                 Ok(ktls) => {
                     let mut stream = ktls.into_messages::<MediumRing>();
                     while let Some(item) = stream.next().await {
