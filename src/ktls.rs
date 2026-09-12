@@ -144,6 +144,9 @@ impl<S> KtlsSocket<S> {
         if ret < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // The ULP is on: every send from here is a `tls_sw_sendmsg`, which
+        // rejects the runtime's default `MSG_WAITALL` with `EOPNOTSUPP`.
+        socket.set_default_msg_flags(0);
         let (tx_seq, tx_secret) = secrets.tx;
         let (rx_seq, rx_secret) = secrets.rx;
         unsafe {

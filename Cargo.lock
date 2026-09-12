@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#7803760ef0173436cd4b9e27187904de3183df34"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#ac59059f757b7ee8699edd84b0c172948aeeba22"
 dependencies = [
  "slab",
  "smallvec",
@@ -109,7 +109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -160,7 +160,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#7803760ef0173436cd4b9e27187904de3183df34"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#ac59059f757b7ee8699edd84b0c172948aeeba22"
 dependencies = [
  "io-uring",
  "rustix",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#7803760ef0173436cd4b9e27187904de3183df34"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#ac59059f757b7ee8699edd84b0c172948aeeba22"
 dependencies = [
  "libc",
  "mimalloc",
@@ -383,7 +383,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#7803760ef0173436cd4b9e27187904de3183df34"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#ac59059f757b7ee8699edd84b0c172948aeeba22"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#7803760ef0173436cd4b9e27187904de3183df34"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#ac59059f757b7ee8699edd84b0c172948aeeba22"
 
 [[package]]
 name = "rustix"
@@ -415,7 +415,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
