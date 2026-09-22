@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use runtime::io_driver::operations::sockets::multi_recv::CompletionError;
+use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
     BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, PooledBuf, WriteControlRecord,
@@ -59,7 +59,15 @@ pub enum StreamState {
 /// pending plaintext that came from the handshake leftover (the very first
 /// item, if the client coalesced its first request with the Finished record).
 /// `None` indicates the stream has ended. `Err` items signal transport-level
-/// failures (RST, etc.).
+/// failures (RST, etc.) — with one exception: an `Err` of kind
+/// [`WouldBlock`](std::io::ErrorKind::WouldBlock) is not a failure at all. The
+/// buffer ring, which every connection on the thread draws from, was empty
+/// when a record arrived. Nothing is lost and the session is untouched: come
+/// back once another holder has recycled a buffer — in practice, once the
+/// other connections on this thread have been polled — and keep reading. A
+/// caller that treats it as fatal drops healthy connections under ring
+/// pressure, and drops them at random: the one that dies is whichever drew the
+/// empty ring, not the one that emptied it.
 ///
 /// TLS 1.3 control records are handled internally:
 /// - **KeyUpdate**: transparent re-keying; the stream keeps yielding frames.
@@ -453,6 +461,25 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                         return Poll::Ready(Some(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "kTLS: record failed AEAD verification (EBADMSG)",
+                        ))));
+                    }
+                    // The ring was empty, not the connection. It refills when
+                    // another holder recycles a buffer, which no poll of this
+                    // stream can bring about — so the runtime hands `ENOBUFS`
+                    // up rather than spinning on it, and classifies it
+                    // `ContinueLater`: the op ended, but it is armable again.
+                    // Both directions stay open, which is the whole difference
+                    // from the arm below.
+                    //
+                    // `WouldBlock` is how that reaches the caller: the one
+                    // error here that means "come back", not "give up". The
+                    // coming back is the caller's to do, and it is enough —
+                    // the next poll re-arms, and what the socket was holding
+                    // is still there to collect.
+                    Some(Err(e)) if matches!(e.continuation(), Continuation::ContinueLater) => {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "buffer ring empty; the recv is armable still",
                         ))));
                     }
                     Some(Err(e)) => {
