@@ -62,7 +62,7 @@ fn close_notify_half_close_round_trip() {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("server handshake");

@@ -100,6 +100,7 @@ impl EchoServer {
                 let mut acc = MultiAccept::new(port).expect("bind");
                 ready_tx.send(()).unwrap();
                 while let Some(socket) = acc.next().await {
+                    let Ok(socket) = socket else { continue };
                     if stop_for_thread.load(Ordering::Relaxed) {
                         break;
                     }

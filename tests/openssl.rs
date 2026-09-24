@@ -58,7 +58,7 @@ fn handshake_then_send_response() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -106,7 +106,7 @@ fn echo_round_trip() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -162,7 +162,7 @@ fn handshake_times_out_on_silent_peer() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let result = handshake(socket, cfg, Duration::from_millis(timeout_ms)).await;
             match result {
                 Err(HandshakeError::Timeout) => {}
@@ -200,7 +200,7 @@ fn alpn_match_succeeds_and_exposes_negotiated_protocol() {
             let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -248,7 +248,7 @@ fn alpn_mismatch_rejects_handshake() {
             let cfg = make_config(Some(&[b"http/1.1"]));
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let result = handshake(socket, cfg, Duration::from_secs(5)).await;
             match result {
                 Err(HandshakeError::Rustls(rustls::Error::NoApplicationProtocol)) => {}
@@ -296,7 +296,7 @@ fn stream_echo_round_trip() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -359,7 +359,7 @@ fn peer_initiated_key_update_round_trip() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -434,7 +434,7 @@ fn peer_requested_key_update_round_trip() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");
@@ -506,7 +506,7 @@ fn server_initiated_key_update_round_trip() {
             let cfg = make_config(None);
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("handshake");

@@ -35,6 +35,7 @@ fn main() {
     main_thread_with::<MediumRing, _>(async move {
         let mut acceptor = MultiAccept::new(9092).expect("bind 9092");
         while let Some(socket) = acceptor.next().await {
+            let Ok(socket) = socket else { continue };
             let cfg = config.clone();
             match handshake(socket, cfg, Duration::from_secs(5)).await {
                 Ok(ktls) => {

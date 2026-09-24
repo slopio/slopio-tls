@@ -30,6 +30,8 @@ use runtime::main_thread_with;
 use runtime::net::MultiAccept;
 use runtime::runtime::time::{Sleep, timeout};
 use runtime_streams::StreamExt;
+
+mod common;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 // Two buffers, no reserve: the smallest ring that can run dry on purpose.
@@ -102,7 +104,7 @@ fn exchange(resume: bool) -> Outcome {
             let cfg = make_server_config();
             let mut acc = MultiAccept::new(port).unwrap();
             ready_tx.send(()).unwrap();
-            let socket = acc.next().await.expect("accept");
+            let socket = common::accept(&mut acc).await;
             let ktls = handshake(socket, cfg, Duration::from_secs(5))
                 .await
                 .expect("server handshake");

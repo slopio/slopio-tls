@@ -174,7 +174,7 @@ enum Rx<R: BufRingSpec> {
     Paused(OwnedReadHalf),
     /// A fatal alert is on its way out; `err` is surfaced once it lands.
     Failing {
-        alert: WriteControlRecord<'static>,
+        alert: WriteControlRecord<&'static [u8; 2]>,
         err: Option<std::io::Error>,
     },
     Closed,
@@ -183,7 +183,7 @@ enum Rx<R: BufRingSpec> {
 enum Tx {
     Idle,
     /// Our KeyUpdate is in flight under the old key; `rotate_tx_key` follows.
-    Rekeying(WriteControlRecord<'static>),
+    Rekeying(WriteControlRecord<&'static [u8; 5]>),
     Closed,
 }
 
