@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use popple_tls::{Config, HandshakeError, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
+use runtime::channels::unbounded_channel;
 use runtime::main_thread_with;
 use runtime::net::{MultiAccept, socket_send};
 use runtime_streams::StreamExt;
@@ -492,6 +493,79 @@ fn peer_requested_key_update_round_trip() {
     assert!(
         stdout.contains("AFTER_REQ_KU"),
         "missing post-KU echo (reciprocal KeyUpdate handling failed?): {stdout:?}"
+    );
+}
+
+/// Same as above with split halves in separate tasks: the reader only flags
+/// the owed KeyUpdate, the writer sends it before its next echo.
+#[test]
+fn split_halves_answer_peer_requested_key_update() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread_with::<MediumRing, _>(async move {
+            let cfg = make_config(None);
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = common::accept(&mut acc).await;
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("handshake");
+            let (mut reader, mut writer) = ktls.into_messages::<MediumRing>().split();
+            let (frames_tx, frames_rx) = unbounded_channel::<Vec<u8>>();
+            runtime::spawn(async move {
+                while let Some(Ok(frame)) = reader.next().await {
+                    frames_tx.send(frame.as_ref().to_vec());
+                }
+            });
+            while let Some(data) = frames_rx.recv().await {
+                if writer.send(data).await.0.is_err() {
+                    break;
+                }
+            }
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-tls1_3",
+            "-servername",
+            "localhost",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn openssl");
+
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "BEFORE_REQ_KU").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        writeln!(stdin, "K").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        writeln!(stdin, "AFTER_REQ_KU").unwrap();
+        thread::sleep(Duration::from_millis(200));
+        writeln!(stdin, "Q").unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+
+    server.join().expect("server thread");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BEFORE_REQ_KU"),
+        "missing pre-KU echo: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("AFTER_REQ_KU"),
+        "missing post-KU echo from the split writer: {stdout:?}"
     );
 }
 

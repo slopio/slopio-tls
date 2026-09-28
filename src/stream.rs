@@ -1,18 +1,22 @@
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
-    BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, PooledBuf, WriteControlRecord,
-    send_all, socket_send_control_record, socket_write_fixed, socket_write_fixed_zc,
+    BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, OwnedWriteHalf, PooledBuf,
+    WriteControlRecord, send_all, socket_send_control_record, socket_write_fixed,
+    socket_write_fixed_zc,
 };
 use runtime_streams::Stream;
+use rustls::kernel::KernelConnection;
 use rustls::server::ServerConnectionData;
 
 use crate::ktls::{
     CLOSE_NOTIFY, ControlAction, KEY_UPDATE_NOT_REQUESTED, KtlsSocket, Prelude,
-    TLS_RECORD_TYPE_ALERT, TLS_RECORD_TYPE_HANDSHAKE,
+    TLS_RECORD_TYPE_ALERT, TLS_RECORD_TYPE_HANDSHAKE, handle_control_record, rotate_tx_key,
 };
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
@@ -89,6 +93,13 @@ pub enum StreamState {
 /// until `None` if the protocol expects the peer to finish talking. Dropping
 /// the stream closes the fd without close_notify.
 ///
+/// # Splitting
+///
+/// [`split`](Self::split) hands out a [`KtlsReader`] and a [`KtlsWriter`] for
+/// separate tasks on the same thread. All TX stays with the writer: a peer's
+/// `request_update` is answered before the writer's next send, as RFC 8446
+/// §4.6.3 allows, never from the reader.
+///
 /// # Key updates
 ///
 /// Key updates are the caller's responsibility; nothing here rekeys on a
@@ -99,11 +110,10 @@ pub enum StreamState {
 /// [`initiate_key_update`], while a send you dropped before completion may
 /// still be in flight.
 ///
-/// KeyUpdates the stream sends itself (a reply to the peer's
-/// `request_update`, or [`initiate_key_update`]) live in the stream, not in
-/// the caller's future: if that future is dropped, the next `send`, `next()`
-/// or `close()` finishes the KeyUpdate and the key rotation before its own
-/// work.
+/// A reply to the peer's `request_update` goes out at the start of our next
+/// send. A KeyUpdate from [`initiate_key_update`] lives in the stream, not in
+/// the caller's future: if that future is dropped, the next send or
+/// `close()` finishes the KeyUpdate and the key rotation before its own work.
 ///
 /// [`initiate_key_update`]: Self::initiate_key_update
 ///
@@ -159,52 +169,85 @@ pub enum StreamState {
 /// post-end query method (`ended_gracefully() -> bool`). Neither is currently
 /// implemented because the application-level fix above is strictly better.
 pub struct KtlsMessages<R: BufRingSpec, S = ServerConnectionData> {
-    ktls: KtlsSocket<S>,
+    reader: KtlsReader<R, S>,
+    writer: KtlsWriter<S>,
+}
+
+/// The receiving half of a [`KtlsMessages`], from [`split`](KtlsMessages::split).
+/// Yields the same items; a peer `request_update` is answered by the
+/// [`KtlsWriter`] before its next send.
+pub struct KtlsReader<R: BufRingSpec, S = ServerConnectionData> {
+    shared: Rc<Shared<S>>,
     /// Plaintext decrypted before the recv was armed; the first frame.
     pending: Option<Vec<u8>>,
     rx: Rx<R>,
-    tx: Tx,
+}
+
+/// The sending half of a [`KtlsMessages`], from [`split`](KtlsMessages::split).
+/// Owns every TX operation, including KeyUpdates the peer asked for.
+pub struct KtlsWriter<S = ServerConnectionData> {
+    shared: Rc<Shared<S>>,
+    socket: OwnedWriteHalf,
+    /// Our KeyUpdate in flight under the old key; `rotate_tx_key` follows.
+    rekey: Option<WriteControlRecord<&'static [u8; 5]>>,
+    tx_records: u64,
+}
+
+/// What both halves touch. Borrows of `kernel_conn` never cross an await.
+struct Shared<S> {
+    kernel_conn: RefCell<KernelConnection<S>>,
+    alpn: Option<&'static [u8]>,
+    /// The peer sent `request_update`; the writer answers before its next send.
+    rekey_owed: Cell<bool>,
+    tx_closed: Cell<bool>,
 }
 
 enum Rx<R: BufRingSpec> {
     /// The multishot recv owns the read half while armed.
     Recving(MultiRecv<R, OwnedReadHalf>),
-    /// Recv terminated (EIO) while `tx` answers a peer KeyUpdate; re-armed
-    /// once the rotation is done.
-    Paused(OwnedReadHalf),
     /// A fatal alert is on its way out; `err` is surfaced once it lands.
+    /// `read` keeps the fd alive for the `shutdown` that follows the alert.
     Failing {
         alert: WriteControlRecord<&'static [u8; 2]>,
+        read: OwnedReadHalf,
         err: Option<std::io::Error>,
     },
     Closed,
 }
 
-enum Tx {
-    Idle,
-    /// Our KeyUpdate is in flight under the old key; `rotate_tx_key` follows.
-    Rekeying(WriteControlRecord<&'static [u8; 5]>),
-    Closed,
-}
-
-impl<R: BufRingSpec, S> Unpin for KtlsMessages<R, S> {}
+impl<R: BufRingSpec, S> Unpin for KtlsReader<R, S> {}
 
 impl<S> KtlsSocket<S> {
-    pub fn into_messages<R: BufRingSpec>(mut self) -> KtlsMessages<R, S> {
-        let Prelude { plaintext, action } = std::mem::take(&mut self.prelude);
-        let read_half = self
-            .read_half
-            .take()
-            .expect("read half is only taken by into_messages");
-        let mut stream = KtlsMessages {
-            ktls: self,
+    pub fn into_messages<R: BufRingSpec>(self) -> KtlsMessages<R, S> {
+        let KtlsSocket {
+            socket,
+            read_half,
+            kernel_conn,
+            alpn,
+            prelude: Prelude { plaintext, action },
+        } = self;
+        let shared = Rc::new(Shared {
+            kernel_conn: RefCell::new(kernel_conn),
+            alpn,
+            rekey_owed: Cell::new(false),
+            tx_closed: Cell::new(false),
+        });
+        let mut reader = KtlsReader {
+            shared: shared.clone(),
             pending: plaintext,
             rx: Rx::Closed,
-            tx: Tx::Idle,
         };
-        // `tx` is Idle here, so `apply` never has an error to hand back.
-        let _ = stream.apply(read_half, action);
-        stream
+        // TX is open here, so `apply` never has an error to hand back.
+        let _ = reader.apply(read_half, action);
+        KtlsMessages {
+            reader,
+            writer: KtlsWriter {
+                shared,
+                socket,
+                rekey: None,
+                tx_records: 0,
+            },
+        }
     }
 }
 
@@ -213,23 +256,79 @@ fn write_closed() -> std::io::Error {
 }
 
 impl<R: BufRingSpec, S> KtlsMessages<R, S> {
+    /// Split into a reader and a writer that can live in different tasks on
+    /// this thread. The fd closes once both are dropped.
+    pub fn split(self) -> (KtlsReader<R, S>, KtlsWriter<S>) {
+        (self.reader, self.writer)
+    }
+
     pub fn alpn(&self) -> Option<&'static [u8]> {
-        self.ktls.alpn()
+        self.writer.alpn()
     }
 
     pub fn tx_records(&self) -> u64 {
-        self.ktls.tx_records()
+        self.writer.tx_records()
     }
 
     pub fn state(&self) -> StreamState {
-        let rx_open = matches!(self.rx, Rx::Recving(_) | Rx::Paused(_));
-        let tx_open = !matches!(self.tx, Tx::Closed);
-        match (rx_open, tx_open) {
+        match (self.reader.is_open(), self.writer.is_open()) {
             (true, true) => StreamState::Open,
             (true, false) => StreamState::ReadOnly,
             (false, true) => StreamState::WriteOnly,
             (false, false) => StreamState::Closed,
         }
+    }
+
+    /// See [`KtlsWriter::initiate_key_update`].
+    pub async fn initiate_key_update(&mut self) -> std::io::Result<()> {
+        self.writer.initiate_key_update().await
+    }
+
+    /// Close our side: send `close_notify`, then `shutdown(SHUT_WR)`. The
+    /// stream moves to `ReadOnly` (or `Closed` if the peer's side was already
+    /// closed); `next()` keeps working. Idempotent.
+    pub async fn close(&mut self) -> std::io::Result<()> {
+        self.writer.close().await
+    }
+
+    /// See [`KtlsWriter::send`].
+    pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
+        self.writer.send(buf).await
+    }
+
+    /// See [`KtlsWriter::send_vectored`].
+    pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
+        self.writer.send_vectored(bufs).await
+    }
+
+    /// See [`KtlsWriter::send_fixed_zc`].
+    pub async fn send_fixed_zc(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        self.writer.send_fixed_zc(buf).await
+    }
+
+    /// See [`KtlsWriter::send_fixed`].
+    pub async fn send_fixed(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        self.writer.send_fixed(buf).await
+    }
+}
+
+impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
+    type Item = std::io::Result<Frame<R>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.reader).poll_next(cx)
+    }
+}
+
+impl<R: BufRingSpec, S> KtlsReader<R, S> {
+    pub fn alpn(&self) -> Option<&'static [u8]> {
+        self.shared.alpn
+    }
+
+    /// Whether the peer's side is still open: `false` once `next()` has
+    /// yielded `None` or a fatal error.
+    pub fn is_open(&self) -> bool {
+        matches!(self.rx, Rx::Recving(_))
     }
 
     /// React to a control record read off the socket. `read` is the read
@@ -239,170 +338,38 @@ impl<R: BufRingSpec, S> KtlsMessages<R, S> {
         match action {
             ControlAction::Continue => self.rx = Rx::Recving(MultiRecv::new(read)),
             ControlAction::End => self.rx = Rx::Closed,
-            ControlAction::SendFatal { err, .. } if matches!(self.tx, Tx::Closed) => {
+            ControlAction::SendFatal { err, .. } if self.shared.tx_closed.get() => {
                 self.rx = Rx::Closed;
                 return Some(err);
             }
             ControlAction::SendFatal { payload, err } => {
-                self.tx = Tx::Closed;
+                self.shared.tx_closed.set(true);
                 self.rx = Rx::Failing {
                     alert: socket_send_control_record(
-                        self.ktls.as_socket(),
+                        read.socket(),
                         TLS_RECORD_TYPE_ALERT,
                         payload,
                     ),
+                    read,
                     err: Some(err),
                 };
             }
-            // RX is already rekeyed; after our close_notify we may not reply.
-            ControlAction::SendKeyUpdate if matches!(self.tx, Tx::Closed) => {
-                self.rx = Rx::Recving(MultiRecv::new(read));
-            }
             ControlAction::SendKeyUpdate => {
-                self.rx = Rx::Paused(read);
-                self.tx = Tx::Rekeying(socket_send_control_record(
-                    self.ktls.as_socket(),
-                    TLS_RECORD_TYPE_HANDSHAKE,
-                    &KEY_UPDATE_NOT_REQUESTED,
-                ));
+                self.shared.rekey_owed.set(true);
+                self.rx = Rx::Recving(MultiRecv::new(read));
             }
         }
         None
     }
 
-    fn poll_rekey(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let Tx::Rekeying(send) = &mut self.tx else {
-            return Poll::Ready(Ok(()));
-        };
-        let result = std::task::ready!(Pin::new(send).poll(cx));
-        self.tx = Tx::Idle;
-        let result = result.and_then(|_| self.ktls.rotate_tx_key());
-        if result.is_err() {
-            self.tx = Tx::Closed;
-        }
-        Poll::Ready(result)
-    }
-
-    /// Finish a KeyUpdate left in flight, then rotate the key.
-    async fn finish_rekey(&mut self) -> std::io::Result<()> {
-        std::future::poll_fn(|cx| self.poll_rekey(cx)).await
-    }
-
-    async fn ready_to_send(&mut self) -> std::io::Result<()> {
-        self.finish_rekey().await?;
-        match self.tx {
-            Tx::Closed => Err(write_closed()),
-            _ => Ok(()),
-        }
-    }
-
-    /// Rotate our TX key: send a KeyUpdate over kTLS, then install the next
-    /// sending key. The KeyUpdate goes out under the old key, as RFC 8446
-    /// §4.6.3 requires, before the rotation. Cancel-safe: see the type-level
-    /// "Key updates" section.
-    pub async fn initiate_key_update(&mut self) -> std::io::Result<()> {
-        self.ready_to_send().await?;
-        self.tx = Tx::Rekeying(socket_send_control_record(
-            self.ktls.as_socket(),
-            TLS_RECORD_TYPE_HANDSHAKE,
-            &KEY_UPDATE_NOT_REQUESTED,
-        ));
-        self.finish_rekey().await
-    }
-
-    /// Close our side: send `close_notify`, then `shutdown(SHUT_WR)`. The
-    /// stream moves to `ReadOnly` (or `Closed` if the peer's side was already
-    /// closed); `next()` keeps working. Idempotent.
-    pub async fn close(&mut self) -> std::io::Result<()> {
-        self.finish_rekey().await?;
-        if matches!(self.tx, Tx::Closed) {
-            return Ok(());
-        }
-        self.tx = Tx::Closed;
-        socket_send_control_record(self.ktls.as_socket(), TLS_RECORD_TYPE_ALERT, &CLOSE_NOTIFY)
-            .await?;
-        if unsafe { libc::shutdown(self.ktls.fd(), libc::SHUT_WR) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// Send the entire plaintext buffer over the kTLS socket, looping over
-    /// short writes internally. The buffer is handed back alongside the result
-    /// so the caller keeps their allocation regardless of success or failure.
-    ///
-    /// Takes ownership of `buf` because io_uring may keep reading from it after
-    /// the future is dropped (cancel-safety). Callers with `&[u8]` should
-    /// `.to_vec()` at the boundary; callers with `&'static [u8]` /
-    /// `&'static [u8; N]` can pass them directly (no allocation).
-    pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
-        if let Err(e) = self.ready_to_send().await {
-            return (Err(e), buf);
-        }
-        let (result, buf) = send_all(self.ktls.as_socket(), buf).await;
-        if result.is_ok() {
-            self.ktls.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
-        }
-        (result, buf)
-    }
-
-    /// Gather-write the supplied plaintext chunks into the kTLS socket.
-    ///
-    /// The kernel packs the concatenated plaintext into TLS 1.3 records (up
-    /// to 16 384 bytes of plaintext each) before encrypting and emitting them
-    /// on the wire, so a vectored send is the cheapest way to coalesce
-    /// scattered buffers into the minimum number of records.
-    ///
-    /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
-    /// handed back alongside the result.
-    pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
-        if let Err(e) = self.ready_to_send().await {
-            return (Err(e), bufs);
-        }
-        let (result, bufs) = send_vectored_all(self.ktls.as_socket(), bufs).await;
-        if result.is_ok() {
-            let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
-            self.ktls.tx_records += (total as u64).div_ceil(16384);
-        }
-        (result, bufs)
-    }
-
-    /// Zero-copy send of a registered (fixed) buffer over the kTLS socket.
-    ///
-    /// `buf` comes from the runtime's `FixedSendBufPool`, so the kernel can transmit it
-    /// without copying into its own send buffers (`SEND_ZC`). The buffer is
-    /// handed back alongside the result for cancel-safety, just like [`send`].
-    ///
-    /// [`send`]: Self::send
-    pub async fn send_fixed_zc(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
-        if let Err(e) = self.ready_to_send().await {
-            return (Err(e), buf);
-        }
-        let (result, buf) = socket_write_fixed_zc(self.ktls.as_socket(), buf).await;
-        if result.is_ok() {
-            self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
-        }
-        (result, buf)
-    }
-
-    /// Send a registered (fixed) buffer over the kTLS socket without the
-    /// zero-copy `SEND_ZC` path. The buffer still avoids the fixed-buffer
-    /// registration cost; the kernel copies it into its send buffers as usual.
-    ///
-    /// The buffer is handed back alongside the result for cancel-safety.
-    pub async fn send_fixed(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
-        if let Err(e) = self.ready_to_send().await {
-            return (Err(e), buf);
-        }
-        let (result, buf) = socket_write_fixed(self.ktls.as_socket(), buf).await;
-        if result.is_ok() {
-            self.ktls.tx_records += (buf.len() as u64).div_ceil(16384);
-        }
-        (result, buf)
+    fn fail(&mut self, err: std::io::Error) -> Poll<Option<std::io::Result<Frame<R>>>> {
+        self.rx = Rx::Closed;
+        self.shared.tx_closed.set(true);
+        Poll::Ready(Some(Err(err)))
     }
 }
 
-impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
+impl<R: BufRingSpec, S> Stream for KtlsReader<R, S> {
     type Item = std::io::Result<Frame<R>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -413,21 +380,14 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
         }
 
         loop {
-            if let Err(e) = std::task::ready!(this.poll_rekey(cx)) {
-                this.rx = Rx::Closed;
-                return Poll::Ready(Some(Err(e)));
-            }
             match &mut this.rx {
                 Rx::Closed => return Poll::Ready(None),
-                Rx::Paused(_) => {
-                    let Rx::Paused(read) = std::mem::replace(&mut this.rx, Rx::Closed) else {
-                        unreachable!()
-                    };
-                    this.rx = Rx::Recving(MultiRecv::new(read));
-                }
-                Rx::Failing { alert, err } => {
+                Rx::Failing { alert, read, err } => {
                     // Best-effort: the original error is surfaced either way.
                     let _ = std::task::ready!(Pin::new(alert).poll(cx));
+                    // Nothing may follow a fatal alert (RFC 8446 §6.2): fail
+                    // any send the writer still has in flight.
+                    unsafe { libc::shutdown(read.socket().fd(), libc::SHUT_WR) };
                     let e = err
                         .take()
                         .unwrap_or_else(|| std::io::Error::other("fatal alert sent"));
@@ -445,7 +405,11 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                             unreachable!()
                         };
                         let read = old.into_inner();
-                        match this.ktls.handle_control_record() {
+                        let action = handle_control_record(
+                            read.socket().fd(),
+                            &mut this.shared.kernel_conn.borrow_mut(),
+                        );
+                        match action {
                             Ok(action) => {
                                 if let Some(e) = this.apply(read, action) {
                                     return Poll::Ready(Some(Err(e)));
@@ -456,12 +420,10 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                     }
                     Some(Err(CompletionError::Other(code))) if code == -libc::EBADMSG => {
                         // AEAD failure: kTLS set sk_err, so no alert can be sent.
-                        this.rx = Rx::Closed;
-                        this.tx = Tx::Closed;
-                        return Poll::Ready(Some(Err(std::io::Error::new(
+                        return this.fail(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "kTLS: record failed AEAD verification (EBADMSG)",
-                        ))));
+                        ));
                     }
                     // The ring was empty, not the connection. It refills when
                     // another holder recycles a buffer, which no poll of this
@@ -482,14 +444,177 @@ impl<R: BufRingSpec, S> Stream for KtlsMessages<R, S> {
                             "buffer ring empty; the recv is armable still",
                         ))));
                     }
-                    Some(Err(e)) => {
-                        this.rx = Rx::Closed;
-                        this.tx = Tx::Closed;
-                        return Poll::Ready(Some(Err(completion_to_io(e))));
-                    }
+                    Some(Err(e)) => return this.fail(completion_to_io(e)),
                 },
             }
         }
+    }
+}
+
+impl<S> KtlsWriter<S> {
+    pub fn alpn(&self) -> Option<&'static [u8]> {
+        self.shared.alpn
+    }
+
+    pub fn tx_records(&self) -> u64 {
+        self.tx_records
+    }
+
+    /// Whether our side is still open: `false` after [`close`](Self::close),
+    /// a failed send or rekey, or a fatal error on the reader.
+    pub fn is_open(&self) -> bool {
+        !self.shared.tx_closed.get()
+    }
+
+    fn start_rekey(&mut self) {
+        self.shared.rekey_owed.set(false);
+        self.rekey = Some(socket_send_control_record(
+            self.socket.socket(),
+            TLS_RECORD_TYPE_HANDSHAKE,
+            &KEY_UPDATE_NOT_REQUESTED,
+        ));
+    }
+
+    fn poll_rekey(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let Some(send) = &mut self.rekey else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = std::task::ready!(Pin::new(send).poll(cx));
+        self.rekey = None;
+        let result = result.and_then(|_| {
+            rotate_tx_key(
+                self.socket.socket().fd(),
+                &mut self.shared.kernel_conn.borrow_mut(),
+            )
+        });
+        match result {
+            Ok(()) => self.tx_records = 0,
+            Err(_) => self.shared.tx_closed.set(true),
+        }
+        Poll::Ready(result)
+    }
+
+    /// Finish a KeyUpdate left in flight, then rotate the key.
+    async fn finish_rekey(&mut self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| self.poll_rekey(cx)).await
+    }
+
+    /// Finish any KeyUpdate in flight and fail if our side is closed.
+    async fn settle(&mut self) -> std::io::Result<()> {
+        self.finish_rekey().await?;
+        match self.shared.tx_closed.get() {
+            true => Err(write_closed()),
+            false => Ok(()),
+        }
+    }
+
+    async fn ready_to_send(&mut self) -> std::io::Result<()> {
+        self.settle().await?;
+        if self.shared.rekey_owed.get() {
+            self.start_rekey();
+            self.finish_rekey().await?;
+        }
+        Ok(())
+    }
+
+    /// Rotate our TX key: send a KeyUpdate over kTLS, then install the next
+    /// sending key. The KeyUpdate goes out under the old key, as RFC 8446
+    /// §4.6.3 requires, before the rotation. Cancel-safe: see the
+    /// "Key updates" section on [`KtlsMessages`].
+    pub async fn initiate_key_update(&mut self) -> std::io::Result<()> {
+        self.settle().await?;
+        self.start_rekey();
+        self.finish_rekey().await
+    }
+
+    /// Close our side: send `close_notify`, then `shutdown(SHUT_WR)`. The
+    /// reader keeps working. Idempotent.
+    pub async fn close(&mut self) -> std::io::Result<()> {
+        self.finish_rekey().await?;
+        if self.shared.tx_closed.get() {
+            return Ok(());
+        }
+        self.shared.tx_closed.set(true);
+        socket_send_control_record(self.socket.socket(), TLS_RECORD_TYPE_ALERT, &CLOSE_NOTIFY)
+            .await?;
+        if unsafe { libc::shutdown(self.socket.socket().fd(), libc::SHUT_WR) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Send the entire plaintext buffer over the kTLS socket, looping over
+    /// short writes internally. The buffer is handed back alongside the result
+    /// so the caller keeps their allocation regardless of success or failure.
+    ///
+    /// Takes ownership of `buf` because io_uring may keep reading from it after
+    /// the future is dropped (cancel-safety). Callers with `&[u8]` should
+    /// `.to_vec()` at the boundary; callers with `&'static [u8]` /
+    /// `&'static [u8; N]` can pass them directly (no allocation).
+    pub async fn send<B: IoBuf>(&mut self, buf: B) -> (std::io::Result<()>, B) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
+        let (result, buf) = send_all(self.socket.socket(), buf).await;
+        if result.is_ok() {
+            self.tx_records += (buf.bytes_init() as u64).div_ceil(16384);
+        }
+        (result, buf)
+    }
+
+    /// Gather-write the supplied plaintext chunks into the kTLS socket.
+    ///
+    /// The kernel packs the concatenated plaintext into TLS 1.3 records (up
+    /// to 16 384 bytes of plaintext each) before encrypting and emitting them
+    /// on the wire, so a vectored send is the cheapest way to coalesce
+    /// scattered buffers into the minimum number of records.
+    ///
+    /// Takes ownership of `bufs` for io_uring cancel-safety; the `Vec` is
+    /// handed back alongside the result.
+    pub async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (std::io::Result<()>, Vec<B>) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), bufs);
+        }
+        let (result, bufs) = send_vectored_all(self.socket.socket(), bufs).await;
+        if result.is_ok() {
+            let total: usize = bufs.iter().map(|b| b.bytes_init()).sum();
+            self.tx_records += (total as u64).div_ceil(16384);
+        }
+        (result, bufs)
+    }
+
+    /// Zero-copy send of a registered (fixed) buffer over the kTLS socket.
+    ///
+    /// `buf` comes from the runtime's `FixedSendBufPool`, so the kernel can transmit it
+    /// without copying into its own send buffers (`SEND_ZC`). The buffer is
+    /// handed back alongside the result for cancel-safety, just like [`send`].
+    ///
+    /// [`send`]: Self::send
+    pub async fn send_fixed_zc(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
+        let (result, buf) = socket_write_fixed_zc(self.socket.socket(), buf).await;
+        if result.is_ok() {
+            self.tx_records += (buf.len() as u64).div_ceil(16384);
+        }
+        (result, buf)
+    }
+
+    /// Send a registered (fixed) buffer over the kTLS socket without the
+    /// zero-copy `SEND_ZC` path. The buffer still avoids the fixed-buffer
+    /// registration cost; the kernel copies it into its send buffers as usual.
+    ///
+    /// The buffer is handed back alongside the result for cancel-safety.
+    pub async fn send_fixed(&mut self, buf: PooledBuf) -> (std::io::Result<usize>, PooledBuf) {
+        if let Err(e) = self.ready_to_send().await {
+            return (Err(e), buf);
+        }
+        let (result, buf) = socket_write_fixed(self.socket.socket(), buf).await;
+        if result.is_ok() {
+            self.tx_records += (buf.len() as u64).div_ceil(16384);
+        }
+        (result, buf)
     }
 }
 

@@ -9,15 +9,12 @@ use crate::pool::PooledBuf;
 pub struct KtlsSocket<S = ServerConnectionData> {
     /// Write half of the connection. Also the handle we use for the fd
     /// (sync `recvmsg`/`setsockopt` and async sends).
-    socket: OwnedWriteHalf,
-    /// Read half, `Some` until `into_messages` hands it to the `MultiRecv`,
-    /// which owns it for as long as the multishot recv is armed.
-    pub(crate) read_half: Option<OwnedReadHalf>,
+    pub(crate) socket: OwnedWriteHalf,
+    pub(crate) read_half: OwnedReadHalf,
     pub(crate) kernel_conn: KernelConnection<S>,
     pub(crate) alpn: Option<&'static [u8]>,
     /// What the software handshake left for the stream; see `Prelude`.
     pub(crate) prelude: Prelude,
-    pub(crate) tx_records: u64,
 }
 
 /// What the receive side saw before a recv could be armed: plaintext
@@ -50,14 +47,8 @@ impl Prelude {
     }
 }
 
-impl Default for Prelude {
-    fn default() -> Self {
-        Self::open(None)
-    }
-}
-
 /// Result of inspecting a control record delivered via the kTLS recvmsg cmsg
-/// path. The caller (the `KtlsMessages` state machine) decides what to do
+/// path. The caller (the `KtlsReader` state machine) decides what to do
 /// next; this enum carries no I/O of its own.
 #[derive(Debug)]
 pub(crate) enum ControlAction {
@@ -65,9 +56,8 @@ pub(crate) enum ControlAction {
     /// the same socket.
     Continue,
     /// A peer KeyUpdate asked us to rekey our TX too (`request_update`). RX is
-    /// already rekeyed; the caller must send our own KeyUpdate over kTLS and
-    /// then rotate the TX key (`rotate_tx_key`) before resuming the recv. The
-    /// send is async (io_uring), so it cannot happen inline here.
+    /// already rekeyed; we owe a KeyUpdate, then `rotate_tx_key`, before our
+    /// next application data (RFC 8446 §4.6.3).
     SendKeyUpdate,
     /// Peer ended the stream cleanly (close_notify alert, any other alert
     /// — RFC 8446 §6 treats all non-close_notify alerts as fatal — or zero-
@@ -95,32 +85,10 @@ impl<S> KtlsSocket<S> {
         self.alpn
     }
 
-    pub fn tx_records(&self) -> u64 {
-        self.tx_records
-    }
-
     /// The peer sent close_notify during the handshake. `into_messages` still
     /// delivers what arrived before it, then ends; sending remains possible.
     pub fn peer_closed(&self) -> bool {
         self.prelude.peer_closed()
-    }
-
-    /// Rotate the TX key: derive the next sending secret and install it in the
-    /// kernel. Call this only *after* the KeyUpdate record announcing the
-    /// change has been sent over kTLS (RFC 8446 §4.6.3 order: the peer must
-    /// still decrypt that record under the old key). The send itself is async
-    /// and lives in the caller (`KtlsMessages`); this is the synchronous
-    /// `setsockopt` tail, which never blocks.
-    pub(crate) fn rotate_tx_key(&mut self) -> std::io::Result<()> {
-        let (seq, secret) = self
-            .kernel_conn
-            .update_tx_secret()
-            .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
-        unsafe {
-            set_crypto_info(self.fd(), TLS_TX, seq, &secret)?;
-        }
-        self.tx_records = 0;
-        Ok(())
     }
 
     pub(crate) fn switch_to_ktls(
@@ -156,176 +124,200 @@ impl<S> KtlsSocket<S> {
         let (read_half, socket) = socket.into_split();
         Ok(KtlsSocket {
             socket,
-            read_half: Some(read_half),
+            read_half,
             kernel_conn,
             alpn,
             prelude,
-            tx_records: 0,
         })
     }
+}
 
-    /// Walk every TLS 1.3 handshake message inside one post-handshake record,
-    /// applying side effects as we go. Rekeys RX inline (a non-blocking
-    /// `setsockopt`). Returns `Ok(true)` if any KeyUpdate asked us to rekey TX
-    /// too — the TX send is async, so the caller drives it — `Ok(false)`
-    /// otherwise, or `Err(ControlAction::SendFatal)` on a protocol violation.
-    fn process_handshake_messages(&mut self, mut payload: &[u8]) -> Result<bool, ControlAction> {
-        let mut tx_rekey_owed = false;
-        while !payload.is_empty() {
-            if payload.len() < 4 {
-                return Err(ControlAction::SendFatal {
-                    payload: &FATAL_DECODE_ERROR,
-                    err: std::io::Error::other("truncated handshake message"),
-                });
-            }
-            let body_len = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
-            if 4 + body_len > payload.len() {
-                return Err(ControlAction::SendFatal {
-                    payload: &FATAL_DECODE_ERROR,
-                    err: std::io::Error::other("handshake message length overruns record"),
-                });
-            }
-            let msg_type = payload[0];
-            let body = &payload[4..4 + body_len];
-            match msg_type {
-                HANDSHAKE_KEY_UPDATE => {
-                    // RFC 8446 §4.6.3: KeyUpdate body is a single byte.
-                    if body.len() != 1 {
-                        return Err(ControlAction::SendFatal {
-                            payload: &FATAL_DECODE_ERROR,
-                            err: std::io::Error::other("KeyUpdate: bad length"),
-                        });
-                    }
-                    let request_update = match body[0] {
-                        0 => false,
-                        1 => true,
-                        _ => {
-                            return Err(ControlAction::SendFatal {
-                                payload: &FATAL_ILLEGAL_PARAMETER,
-                                err: std::io::Error::other(
-                                    "KeyUpdate: KeyUpdateRequest must be 0 or 1",
-                                ),
-                            });
-                        }
-                    };
-                    let (seq, secret) = self.kernel_conn.update_rx_secret().map_err(|e| {
-                        ControlAction::SendFatal {
-                            payload: &FATAL_DECODE_ERROR,
-                            err: std::io::Error::other(format!("update_rx_secret: {e:?}")),
-                        }
-                    })?;
-                    unsafe {
-                        set_crypto_info(self.fd(), TLS_RX, seq, &secret).map_err(|e| {
-                            ControlAction::SendFatal {
-                                payload: &FATAL_DECODE_ERROR,
-                                err: e,
-                            }
-                        })?;
-                    }
-                    if request_update {
-                        tx_rekey_owed = true;
-                    }
-                }
-                HANDSHAKE_NEW_SESSION_TICKET => {
-                    // We don't implement TLS 1.3 resumption (yet), so the
-                    // ticket is dropped on the floor. Once resumption is
-                    // wired up, this is where the body would be handed to
-                    // `KernelConnection<ClientConnectionData>::handle_new_session_ticket`.
-                }
-                _ => {
+/// Rotate the TX key: derive the next sending secret and install it in the
+/// kernel. Call this only *after* the KeyUpdate record announcing the
+/// change has been sent over kTLS (RFC 8446 §4.6.3 order: the peer must
+/// still decrypt that record under the old key). The send itself is async
+/// and lives in the caller (`KtlsWriter`); this is the synchronous
+/// `setsockopt` tail, which never blocks.
+pub(crate) fn rotate_tx_key<S>(fd: i32, conn: &mut KernelConnection<S>) -> std::io::Result<()> {
+    let (seq, secret) = conn
+        .update_tx_secret()
+        .map_err(|e| std::io::Error::other(format!("update_tx_secret: {e:?}")))?;
+    unsafe { set_crypto_info(fd, TLS_TX, seq, &secret) }
+}
+
+/// Read the control record the kernel is holding (signalled by an EIO
+/// completion on the recv ring) and decide how the stream should react.
+/// The record is already decrypted and parked on the socket's rx list,
+/// so the blocking `recvmsg` returns immediately.
+pub(crate) fn handle_control_record<S>(
+    fd: i32,
+    conn: &mut KernelConnection<S>,
+) -> std::io::Result<ControlAction> {
+    let mut buf = PooledBuf::new();
+    let (record_type, n) = recv_record(fd, &mut buf, 0)?;
+    Ok(control_action(fd, conn, record_type, &buf[..n]))
+}
+
+/// Walk every TLS 1.3 handshake message inside one post-handshake record,
+/// applying side effects as we go. Rekeys RX inline (a non-blocking
+/// `setsockopt`). Returns `Ok(true)` if any KeyUpdate asked us to rekey TX
+/// too — the TX send is async, so the caller drives it — `Ok(false)`
+/// otherwise, or `Err(ControlAction::SendFatal)` on a protocol violation.
+fn process_handshake_messages<S>(
+    fd: i32,
+    conn: &mut KernelConnection<S>,
+    mut payload: &[u8],
+) -> Result<bool, ControlAction> {
+    let mut tx_rekey_owed = false;
+    while !payload.is_empty() {
+        if payload.len() < 4 {
+            return Err(ControlAction::SendFatal {
+                payload: &FATAL_DECODE_ERROR,
+                err: std::io::Error::other("truncated handshake message"),
+            });
+        }
+        let body_len = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]) as usize;
+        if 4 + body_len > payload.len() {
+            return Err(ControlAction::SendFatal {
+                payload: &FATAL_DECODE_ERROR,
+                err: std::io::Error::other("handshake message length overruns record"),
+            });
+        }
+        let msg_type = payload[0];
+        let body = &payload[4..4 + body_len];
+        match msg_type {
+            HANDSHAKE_KEY_UPDATE => {
+                // RFC 8446 §4.6.3: KeyUpdate body is a single byte.
+                if body.len() != 1 {
                     return Err(ControlAction::SendFatal {
-                        payload: &FATAL_UNEXPECTED_MESSAGE,
-                        err: std::io::Error::other("unexpected post-handshake handshake message"),
+                        payload: &FATAL_DECODE_ERROR,
+                        err: std::io::Error::other("KeyUpdate: bad length"),
                     });
                 }
-            }
-            payload = &payload[4 + body_len..];
-        }
-        Ok(tx_rekey_owed)
-    }
-
-    /// One `recvmsg` into `buf`, returning `(record_type, len)`. The kernel
-    /// attaches no cmsg on TCP EOF, so that case reads as type 0, `len == 0`.
-    fn recv_record(&self, buf: &mut PooledBuf, flags: libc::c_int) -> std::io::Result<(u8, usize)> {
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let mut cmsg = TlsCmsg {
-            hdr: unsafe { std::mem::zeroed() },
-            record_type: 0,
-        };
-        cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
-        cmsg.hdr.cmsg_level = SOL_TLS;
-        cmsg.hdr.cmsg_type = TLS_GET_RECORD_TYPE;
-
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
-        msg.msg_controllen = size_of::<TlsCmsg>() as _;
-
-        let n = unsafe { libc::recvmsg(self.fd(), &mut msg, flags) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok((cmsg.record_type, n as usize))
-    }
-
-    /// How the stream reacts to a non-application-data record. Rekeys RX
-    /// inline on KeyUpdate; never sends an alert itself (that is async, in
-    /// the stream's state machine). A zero-length payload is either TCP EOF
-    /// (type 0) or an empty control record (cmsg present), hence the arms
-    /// match on the type.
-    fn control_action(&mut self, record_type: u8, payload: &[u8]) -> ControlAction {
-        match record_type {
-            TLS_RECORD_TYPE_HANDSHAKE => {
-                // RFC 8446 §4: every post-handshake message starts with
-                // HandshakeType(1) || uint24 length || body. A single record
-                // can carry multiple messages back-to-back (rustls servers
-                // coalesce all four default NewSessionTickets into one
-                // record), so the parser loops until the record is consumed.
-                //
-                // Accepted here:
-                //   - KeyUpdate (24): rekey RX, optionally TX.
-                //   - NewSessionTicket (4): silently discarded. We don't
-                //     implement resumption yet, and servers send these by
-                //     default in TLS 1.3.
-                // Anything else is unexpected_message; malformed framing is
-                // decode_error.
-                match self.process_handshake_messages(payload) {
-                    Ok(true) => ControlAction::SendKeyUpdate,
-                    Ok(false) => ControlAction::Continue,
-                    Err(action) => action,
+                let request_update = match body[0] {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(ControlAction::SendFatal {
+                            payload: &FATAL_ILLEGAL_PARAMETER,
+                            err: std::io::Error::other(
+                                "KeyUpdate: KeyUpdateRequest must be 0 or 1",
+                            ),
+                        });
+                    }
+                };
+                let (seq, secret) =
+                    conn.update_rx_secret()
+                        .map_err(|e| ControlAction::SendFatal {
+                            payload: &FATAL_DECODE_ERROR,
+                            err: std::io::Error::other(format!("update_rx_secret: {e:?}")),
+                        })?;
+                unsafe {
+                    set_crypto_info(fd, TLS_RX, seq, &secret).map_err(|e| {
+                        ControlAction::SendFatal {
+                            payload: &FATAL_DECODE_ERROR,
+                            err: e,
+                        }
+                    })?;
+                }
+                if request_update {
+                    tx_rekey_owed = true;
                 }
             }
-            // Per RFC 8446 §6, alert records carry exactly 2 bytes
-            // (level + description); shorter is malformed → decode_error.
-            TLS_RECORD_TYPE_ALERT if payload.len() < 2 => ControlAction::SendFatal {
-                payload: &FATAL_DECODE_ERROR,
-                err: std::io::Error::other("truncated alert record"),
-            },
-            // Any peer alert ends the stream. TLS 1.3 treats every alert
-            // except close_notify/user_canceled as fatal anyway; we simply
-            // stop receiving and let the caller surface `None`.
-            TLS_RECORD_TYPE_ALERT => ControlAction::End,
-            // No cmsg, no bytes: TCP EOF.
-            0 if payload.is_empty() => ControlAction::End,
-            _ => ControlAction::SendFatal {
-                payload: &FATAL_UNEXPECTED_MESSAGE,
-                err: std::io::Error::other("unexpected TLS record type"),
-            },
+            HANDSHAKE_NEW_SESSION_TICKET => {
+                // We don't implement TLS 1.3 resumption (yet), so the
+                // ticket is dropped on the floor. Once resumption is
+                // wired up, this is where the body would be handed to
+                // `KernelConnection<ClientConnectionData>::handle_new_session_ticket`.
+            }
+            _ => {
+                return Err(ControlAction::SendFatal {
+                    payload: &FATAL_UNEXPECTED_MESSAGE,
+                    err: std::io::Error::other("unexpected post-handshake handshake message"),
+                });
+            }
         }
+        payload = &payload[4 + body_len..];
     }
+    Ok(tx_rekey_owed)
+}
 
-    /// Read the control record the kernel is holding (signalled by an EIO
-    /// completion on the recv ring) and decide how the stream should react.
-    /// The record is already decrypted and parked on the socket's rx list,
-    /// so the blocking `recvmsg` returns immediately.
-    pub(crate) fn handle_control_record(&mut self) -> std::io::Result<ControlAction> {
-        let mut buf = PooledBuf::new();
-        let (record_type, n) = self.recv_record(&mut buf, 0)?;
-        Ok(self.control_action(record_type, &buf[..n]))
+/// One `recvmsg` into `buf`, returning `(record_type, len)`. The kernel
+/// attaches no cmsg on TCP EOF, so that case reads as type 0, `len == 0`.
+fn recv_record(fd: i32, buf: &mut PooledBuf, flags: libc::c_int) -> std::io::Result<(u8, usize)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut cmsg = TlsCmsg {
+        hdr: unsafe { std::mem::zeroed() },
+        record_type: 0,
+    };
+    cmsg.hdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of::<u8>() as u32) } as _;
+    cmsg.hdr.cmsg_level = SOL_TLS;
+    cmsg.hdr.cmsg_type = TLS_GET_RECORD_TYPE;
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = &mut cmsg as *mut _ as *mut libc::c_void;
+    msg.msg_controllen = size_of::<TlsCmsg>() as _;
+
+    let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((cmsg.record_type, n as usize))
+}
+
+/// How the stream reacts to a non-application-data record. Rekeys RX
+/// inline on KeyUpdate; never sends an alert itself (that is async, in
+/// the stream's state machine). A zero-length payload is either TCP EOF
+/// (type 0) or an empty control record (cmsg present), hence the arms
+/// match on the type.
+fn control_action<S>(
+    fd: i32,
+    conn: &mut KernelConnection<S>,
+    record_type: u8,
+    payload: &[u8],
+) -> ControlAction {
+    match record_type {
+        TLS_RECORD_TYPE_HANDSHAKE => {
+            // RFC 8446 §4: every post-handshake message starts with
+            // HandshakeType(1) || uint24 length || body. A single record
+            // can carry multiple messages back-to-back (rustls servers
+            // coalesce all four default NewSessionTickets into one
+            // record), so the parser loops until the record is consumed.
+            //
+            // Accepted here:
+            //   - KeyUpdate (24): rekey RX, optionally TX.
+            //   - NewSessionTicket (4): silently discarded. We don't
+            //     implement resumption yet, and servers send these by
+            //     default in TLS 1.3.
+            // Anything else is unexpected_message; malformed framing is
+            // decode_error.
+            match process_handshake_messages(fd, conn, payload) {
+                Ok(true) => ControlAction::SendKeyUpdate,
+                Ok(false) => ControlAction::Continue,
+                Err(action) => action,
+            }
+        }
+        // Per RFC 8446 §6, alert records carry exactly 2 bytes
+        // (level + description); shorter is malformed → decode_error.
+        TLS_RECORD_TYPE_ALERT if payload.len() < 2 => ControlAction::SendFatal {
+            payload: &FATAL_DECODE_ERROR,
+            err: std::io::Error::other("truncated alert record"),
+        },
+        // Any peer alert ends the stream. TLS 1.3 treats every alert
+        // except close_notify/user_canceled as fatal anyway; we simply
+        // stop receiving and let the caller surface `None`.
+        TLS_RECORD_TYPE_ALERT => ControlAction::End,
+        // No cmsg, no bytes: TCP EOF.
+        0 if payload.is_empty() => ControlAction::End,
+        _ => ControlAction::SendFatal {
+            payload: &FATAL_UNEXPECTED_MESSAGE,
+            err: std::io::Error::other("unexpected TLS record type"),
+        },
     }
 }
 
