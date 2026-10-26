@@ -202,6 +202,19 @@ struct Shared<S> {
     tx_closed: Cell<bool>,
 }
 
+/// Records a reader may have received and not yet taken before its recv
+/// pauses. Each holds a buffer of the ring every connection on the worker
+/// shares, however few bytes it carries, and a reader whose task is stalled
+/// (in a send to a peer that does not read, say) takes nothing: at the
+/// runtime's default of 32, a few such connections empty the ring for every
+/// connection on the worker. Paused, the peer's bytes wait in the socket, for
+/// TCP to push back with.
+const RECV_QUEUE_LIMIT: usize = 4;
+
+fn recv<R: BufRingSpec>(read: OwnedReadHalf) -> MultiRecv<R, OwnedReadHalf> {
+    MultiRecv::with_queue_limit(read, RECV_QUEUE_LIMIT)
+}
+
 enum Rx<R: BufRingSpec> {
     /// The multishot recv owns the read half while armed.
     Recving(MultiRecv<R, OwnedReadHalf>),
@@ -336,7 +349,7 @@ impl<R: BufRingSpec, S> KtlsReader<R, S> {
     /// surface right away when no alert can be sent.
     fn apply(&mut self, read: OwnedReadHalf, action: ControlAction) -> Option<std::io::Error> {
         match action {
-            ControlAction::Continue => self.rx = Rx::Recving(MultiRecv::new(read)),
+            ControlAction::Continue => self.rx = Rx::Recving(recv(read)),
             ControlAction::End => self.rx = Rx::Closed,
             ControlAction::SendFatal { err, .. } if self.shared.tx_closed.get() => {
                 self.rx = Rx::Closed;
@@ -356,7 +369,7 @@ impl<R: BufRingSpec, S> KtlsReader<R, S> {
             }
             ControlAction::SendKeyUpdate => {
                 self.shared.rekey_owed.set(true);
-                self.rx = Rx::Recving(MultiRecv::new(read));
+                self.rx = Rx::Recving(recv(read));
             }
         }
         None
