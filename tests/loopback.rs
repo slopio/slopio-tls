@@ -271,13 +271,13 @@ fn vectored_send_round_trip() {
     server.join().expect("server thread");
 }
 
-/// Server sends "before", initiates a TLS 1.3 KeyUpdate (rotating its
-/// TX secret and rearming `kTLS_TX`), then sends "after" under the new
-/// key. Client must transparently process the KeyUpdate control record
-/// — `handle_control_record` decodes it, rotates `kTLS_RX`, and the
-/// stream re-arms its MultiRecv — and surface both payloads as ordinary
-/// frames. If the rekey on either side were broken, "after" would
-/// either fail to decrypt (EBADMSG → stream error) or never decode.
+/// Once the client says "go", the server sends "before", initiates a TLS 1.3
+/// KeyUpdate (rotating its TX secret and rearming `kTLS_TX`), then sends
+/// "after" under the new key. Client must transparently process the KeyUpdate
+/// control record — `handle_control_record` decodes it, rotates `kTLS_RX`, and
+/// the stream re-arms its MultiRecv — and surface both payloads as ordinary
+/// frames. If the rekey on either side were broken, "after" would either fail
+/// to decrypt (EBADMSG → stream error) or never decode.
 #[test]
 fn server_initiated_key_update_round_trip() {
     init_provider();
@@ -295,6 +295,11 @@ fn server_initiated_key_update_round_trip() {
                 .expect("server handshake");
 
             let mut stream = ktls.into_messages::<MediumRing>();
+            // Only once the client says so: closing before it has attached
+            // kTLS would leave its socket past ESTABLISHED, where the ULP is
+            // refused with ENOTCONN.
+            let go = stream.next().await.expect("go").expect("go ok");
+            assert_eq!(go.as_ref(), b"go");
             stream.send(b"before").await.0.expect("send before");
             stream
                 .initiate_key_update()
@@ -320,6 +325,7 @@ fn server_initiated_key_update_round_trip() {
             .expect("client connect");
 
             let mut stream = ktls.into_messages::<MediumRing>();
+            stream.send(b"go").await.0.expect("send go");
             let mut received = Vec::new();
             while let Some(item) = stream.next().await {
                 let frame = item.expect("frame ok");
