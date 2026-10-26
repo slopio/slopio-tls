@@ -8,7 +8,7 @@ use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{ConnectionState, EncodeError, UnbufferedStatus};
 
 use crate::config::Config;
-use crate::ktls::{KtlsSocket, Prelude};
+use crate::ktls::{KtlsSocket, Prelude, attach_ulp};
 use crate::pool::{BUFFER_SIZE as RECORD_BUF, PooledBuf};
 
 #[derive(Debug)]
@@ -129,6 +129,12 @@ pub(crate) async fn drive_handshake<C: UnbufferedDriver>(
     mut conn: C,
     alpn_protocols: &'static [&'static [u8]],
 ) -> Result<KtlsSocket<C::Data>, HandshakeError> {
+    // Now, while the socket is surely established; see `attach_ulp`. A peer
+    // already gone has nothing to hand-shake with.
+    attach_ulp(&socket).map_err(|e| match e.raw_os_error() {
+        Some(libc::ENOTCONN) => HandshakeError::PeerClosed,
+        _ => HandshakeError::Io(e),
+    })?;
     let mut in_buf = PooledBuf::new();
     let mut out_buf = PooledBuf::new();
     let mut filled: usize = 0;

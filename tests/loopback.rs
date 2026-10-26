@@ -341,3 +341,55 @@ fn server_initiated_key_update_round_trip() {
     client.join().expect("client thread");
     server.join().expect("server thread");
 }
+
+/// A server that sends and closes as soon as its handshake is done, without
+/// waiting for anything from the client. Its FIN can reach the client before
+/// the client has finished its own side: the client must still read what was
+/// sent, which it can only because its TLS ULP went on while the socket was
+/// established, before the handshake.
+#[test]
+fn a_server_that_closes_right_after_the_handshake_is_still_read() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+    let server = thread::spawn(move || {
+        main_thread_with::<MediumRing, _>(async move {
+            let cfg = make_server_config();
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = common::accept(&mut acc).await;
+            let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                .await
+                .expect("server handshake");
+            let mut stream = ktls.into_messages::<MediumRing>();
+            stream.send(b"bye").await.0.expect("send bye");
+        });
+    });
+
+    ready_rx.recv().unwrap();
+
+    let client = thread::spawn(move || {
+        main_thread_with::<MediumRing, _>(async move {
+            let cfg = client_config_dangerous_no_verification(None).expect("client config");
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let ktls = connect(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                server_name,
+                cfg,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("client connect");
+            let mut stream = ktls.into_messages::<MediumRing>();
+            let mut received = Vec::new();
+            while let Some(item) = stream.next().await {
+                received.extend_from_slice(item.expect("frame ok").as_ref());
+            }
+            assert_eq!(received, b"bye");
+        });
+    });
+
+    client.join().expect("client thread");
+    server.join().expect("server thread");
+}

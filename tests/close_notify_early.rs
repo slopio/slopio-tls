@@ -292,3 +292,112 @@ fn close_notify_coalesced_with_finished_delivers_request_then_ends() {
         "client did not get the reply to its pipelined request"
     );
 }
+
+/// Timing 3: as timing 2, and the client then shuts its side of the TCP
+/// connection too, so the FIN is in the server's kernel queue before the
+/// server attaches kTLS. Past ESTABLISHED the kernel refuses the TLS ULP with
+/// ENOTCONN, so a server that attaches only after its handshake fails here
+/// every time, and loses a request it was sent in full. The ULP must already
+/// be on, attached while the socket was still established.
+#[test]
+fn a_peer_gone_before_the_attach_still_has_its_request_answered() {
+    init_provider();
+    let port = pick_port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
+
+    let server = thread::spawn(move || {
+        main_thread_with::<MediumRing, _>(async move {
+            let cfg = make_server_config();
+            let mut acc = MultiAccept::new(port).unwrap();
+            ready_tx.send(()).unwrap();
+            let socket = common::accept(&mut acc).await;
+            let outcome = async {
+                let ktls = handshake(socket, cfg, Duration::from_secs(5))
+                    .await
+                    .map_err(|e| format!("handshake failed with the peer's FIN queued: {e}"))?;
+                let mut stream = ktls.into_messages::<MediumRing>();
+                let first = timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .map_err(|_| "hung waiting for the first frame".to_string())?
+                    .ok_or("stream ended before delivering the request")?
+                    .map_err(|e| format!("first frame error: {e}"))?;
+                if first.as_ref() != REQUEST {
+                    return Err(format!("wrong request: {:?}", first.as_ref()));
+                }
+                let end = timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .map_err(|_| "hung after the request instead of yielding None".to_string())?;
+                if end.is_some() {
+                    return Err("expected None after the request".into());
+                }
+                // Only the peer's side is shut: the answer still goes out.
+                stream
+                    .send(RESPONSE.to_vec())
+                    .await
+                    .0
+                    .map_err(|e| format!("send after the peer's FIN failed: {e}"))?;
+                Ok(())
+            }
+            .await;
+            result_tx.send(outcome).unwrap();
+        });
+    });
+    ready_rx.recv().unwrap();
+
+    let client = thread::spawn(move || {
+        let cfg = client_config_dangerous_no_verification(None).expect("client config");
+        let rustls_cfg: Arc<rustls::ClientConfig> = cfg.rustls;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+        let mut conn =
+            rustls::ClientConnection::new(rustls_cfg, ServerName::try_from("localhost").unwrap())
+                .expect("client conn");
+
+        while conn.wants_write() {
+            conn.write_tls(&mut sock).expect("write ClientHello");
+        }
+        while conn.is_handshaking() {
+            let n = conn.read_tls(&mut sock).expect("read server flight");
+            assert!(n > 0, "server closed during handshake");
+            conn.process_new_packets().expect("process server flight");
+        }
+        // Finished, request and close_notify in one write, then the FIN.
+        conn.writer().write_all(REQUEST).unwrap();
+        conn.send_close_notify();
+        let mut burst = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut burst).unwrap();
+        }
+        sock.write_all(&burst).expect("write burst");
+        sock.shutdown(std::net::Shutdown::Write)
+            .expect("shut the write side");
+
+        let mut response = Vec::new();
+        while response.len() < RESPONSE.len() {
+            match conn.read_tls(&mut sock) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => panic!("read_tls: {e}"),
+            }
+            let state = conn.process_new_packets().expect("process response");
+            let n = state.plaintext_bytes_to_read();
+            if n > 0 {
+                let mut chunk = vec![0u8; n];
+                conn.reader().read_exact(&mut chunk).unwrap();
+                response.extend_from_slice(&chunk);
+            }
+        }
+        response
+    });
+
+    // The server's outcome first: when it fails, the client only sees the
+    // reset that follows.
+    let outcome = result_rx.recv().expect("server result");
+    outcome.unwrap_or_else(|e| panic!("{e}"));
+    let response = client.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        response, RESPONSE,
+        "client did not get the reply to the request it sent before its FIN"
+    );
+}

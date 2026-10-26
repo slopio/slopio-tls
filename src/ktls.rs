@@ -6,6 +6,29 @@ use zeroize::Zeroize;
 
 use crate::pool::PooledBuf;
 
+/// Put the TLS ULP on a connected socket, before its handshake. The kernel
+/// takes it only while the socket is ESTABLISHED: attached after the
+/// handshake, a peer that finished its side, sent and closed in the meantime
+/// would leave it refused with ENOTCONN, and what it sent unread. Until the
+/// keys are installed the socket carries plain TCP, so the handshake runs
+/// over it unchanged.
+pub(crate) fn attach_ulp(socket: &SocketWrapper) -> std::io::Result<()> {
+    let ulp = b"tls";
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.fd(),
+            libc::SOL_TCP,
+            libc::TCP_ULP,
+            ulp.as_ptr() as *const libc::c_void,
+            ulp.len() as libc::socklen_t,
+        )
+    };
+    match ret {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 pub struct KtlsSocket<S = ServerConnectionData> {
     /// Write half of the connection. Also the handle we use for the fd
     /// (sync `recvmsg`/`setsockopt` and async sends).
@@ -91,6 +114,8 @@ impl<S> KtlsSocket<S> {
         self.prelude.peer_closed()
     }
 
+    /// The ULP is already on, from [`attach_ulp`] before the handshake: this
+    /// only installs the keys, which the kernel takes past ESTABLISHED too.
     pub(crate) fn switch_to_ktls(
         socket: SocketWrapper,
         secrets: ExtractedSecrets,
@@ -98,22 +123,9 @@ impl<S> KtlsSocket<S> {
         alpn: Option<&'static [u8]>,
         prelude: Prelude,
     ) -> std::io::Result<Self> {
-        let ulp = b"tls";
         let fd = socket.fd();
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_TCP,
-                libc::TCP_ULP,
-                ulp.as_ptr() as *const libc::c_void,
-                ulp.len() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // The ULP is on: every send from here is a `tls_sw_sendmsg`, which
-        // rejects the runtime's default `MSG_WAITALL` with `EOPNOTSUPP`.
+        // With TLS_TX installed below, every send is a `tls_sw_sendmsg`,
+        // which rejects the runtime's default `MSG_WAITALL` with `EOPNOTSUPP`.
         socket.set_default_msg_flags(0);
         let (tx_seq, tx_secret) = secrets.tx;
         let (rx_seq, rx_secret) = secrets.rx;
