@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # runtime is private: read-only deploy key on saucisoupe/runtime
+      # runtime is private: read-only deploy key on slopio/slopio
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.RUNTIME_DEPLOY_KEY }}
