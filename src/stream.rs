@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
+use runtime::io_driver::operations::sockets::recv::{ClassicRecv, socket_recv};
 use runtime::io_driver::operations::sockets::send_vectored::send_vectored_all;
 use runtime::net::{
     BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, OwnedWriteHalf, PooledBuf,
@@ -21,11 +22,12 @@ use crate::ktls::{
 
 /// A decrypted application-data frame yielded by [`KtlsMessages`].
 ///
-/// `Owned` is plaintext that was decrypted by rustls in userspace during the
-/// handshake (the leftover-after-Finished case). `Borrowed` is plaintext
-/// decrypted by the kernel via kTLS and delivered through the multishot recv
-/// buffer ring. Both implement `AsRef<[u8]>`, so callers can treat them
-/// uniformly.
+/// `Borrowed` is plaintext decrypted by the kernel via kTLS and delivered
+/// through the multishot recv buffer ring. `Owned` is plaintext in a buffer
+/// of the stream's own: decrypted by rustls in userspace during the
+/// handshake (the leftover-after-Finished case), or by the kernel while the
+/// ring had no buffer to lend. Both implement `AsRef<[u8]>`, so callers can
+/// treat them uniformly.
 #[non_exhaustive]
 pub enum Frame<R: BufRingSpec> {
     Owned(Vec<u8>),
@@ -63,15 +65,13 @@ pub enum StreamState {
 /// pending plaintext that came from the handshake leftover (the very first
 /// item, if the client coalesced its first request with the Finished record).
 /// `None` indicates the stream has ended. `Err` items signal transport-level
-/// failures (RST, etc.) — with one exception: an `Err` of kind
-/// [`WouldBlock`](std::io::ErrorKind::WouldBlock) is not a failure at all. The
-/// buffer ring, which every connection on the thread draws from, was empty
-/// when a record arrived. Nothing is lost and the session is untouched: come
-/// back once another holder has recycled a buffer — in practice, once the
-/// other connections on this thread have been polled — and keep reading. A
-/// caller that treats it as fatal drops healthy connections under ring
-/// pressure, and drops them at random: the one that dies is whichever drew the
-/// empty ring, not the one that emptied it.
+/// failures (RST, etc.).
+///
+/// An empty buffer ring, which every connection on the thread draws from, is
+/// not one: the stream reads into buffers of its own until the socket has
+/// nothing more, then goes back to the ring. Waiting for a buffer instead
+/// lost each one to the recvs still armed on other connections, for seconds
+/// at a time, and a peer holding the ring's buffers slowed everyone.
 ///
 /// TLS 1.3 control records are handled internally:
 /// - **KeyUpdate**: transparent re-keying; the stream keeps yielding frames.
@@ -181,7 +181,20 @@ pub struct KtlsReader<R: BufRingSpec, S = ServerConnectionData> {
     /// Plaintext decrypted before the recv was armed; the first frame.
     pending: Option<Vec<u8>>,
     rx: Rx<R>,
+    /// A recv into a buffer of our own, while the ring has none to lend.
+    /// Only ever between a multishot that ended on the empty ring and the
+    /// next one: nothing else reads the socket meanwhile.
+    own: Option<ClassicRecv<Vec<u8>>>,
+    /// The last one filled its buffer: more is likely waiting in the socket,
+    /// to be read the same way rather than through a multishot re-armed into
+    /// a ring that may still be empty.
+    own_again: bool,
 }
+
+/// How much a recv of the reader's own takes: a buffer of the bench rings'
+/// size, since a reader that keeps them coming back full reads this way for
+/// as long as its peer sends. One at a time, handed out as a frame.
+const OWN_RECV: usize = 64 * 1024;
 
 /// The sending half of a [`KtlsMessages`], from [`split`](KtlsMessages::split).
 /// Owns every TX operation, including KeyUpdates the peer asked for.
@@ -249,6 +262,8 @@ impl<S> KtlsSocket<S> {
             shared: shared.clone(),
             pending: plaintext,
             rx: Rx::Closed,
+            own: None,
+            own_again: false,
         };
         // TX is open here, so `apply` never has an error to hand back.
         let _ = reader.apply(read_half, action);
@@ -380,6 +395,33 @@ impl<R: BufRingSpec, S> KtlsReader<R, S> {
         self.shared.tx_closed.set(true);
         Poll::Ready(Some(Err(err)))
     }
+
+    /// `EIO`: the next record is not application data. The multishot is over
+    /// (it ended on it, or on the empty ring before a recv of our own met
+    /// it), so its read half is free to read the record and apply it.
+    /// Returns an error to surface right away.
+    fn on_control_record(&mut self) -> Option<std::io::Error> {
+        let Rx::Recving(old) = std::mem::replace(&mut self.rx, Rx::Closed) else {
+            unreachable!("only a receiving stream reads records")
+        };
+        let read = old.into_inner();
+        let action = handle_control_record(
+            read.socket().fd(),
+            &mut self.shared.kernel_conn.borrow_mut(),
+        );
+        match action {
+            Ok(action) => self.apply(read, action),
+            Err(e) => Some(e),
+        }
+    }
+
+    fn read_own(&mut self) {
+        let Rx::Recving(recv) = &self.rx else {
+            unreachable!("only a receiving stream reads")
+        };
+        let buf = Vec::with_capacity(OWN_RECV);
+        self.own = Some(socket_recv(recv.socket(), buf));
+    }
 }
 
 impl<R: BufRingSpec, S> Stream for KtlsReader<R, S> {
@@ -407,6 +449,36 @@ impl<R: BufRingSpec, S> Stream for KtlsReader<R, S> {
                     this.rx = Rx::Closed;
                     return Poll::Ready(Some(Err(e)));
                 }
+                Rx::Recving(_) if this.own.is_some() => {
+                    let own = this.own.as_mut().expect("checked");
+                    let (result, buf) = std::task::ready!(Pin::new(own).poll(cx));
+                    this.own = None;
+                    match result {
+                        Ok(0) => {
+                            this.rx = Rx::Closed;
+                            return Poll::Ready(None);
+                        }
+                        Ok(n) => {
+                            this.own_again = n == OWN_RECV;
+                            return Poll::Ready(Some(Ok(Frame::Owned(buf))));
+                        }
+                        // A control record next, read as the multishot's are.
+                        Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                            this.own_again = false;
+                            if let Some(e) = this.on_control_record() {
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
+                        Err(e) if e.raw_os_error() == Some(libc::EBADMSG) => {
+                            return this.fail(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "kTLS: record failed AEAD verification (EBADMSG)",
+                            ));
+                        }
+                        Err(e) => return this.fail(e),
+                    }
+                }
+                Rx::Recving(_) if this.own_again => this.read_own(),
                 Rx::Recving(recv) => match std::task::ready!(Pin::new(recv).poll_next(cx)) {
                     None => {
                         this.rx = Rx::Closed;
@@ -414,21 +486,8 @@ impl<R: BufRingSpec, S> Stream for KtlsReader<R, S> {
                     }
                     Some(Ok(buf)) => return Poll::Ready(Some(Ok(Frame::Borrowed(buf)))),
                     Some(Err(CompletionError::Other(code))) if code == -libc::EIO => {
-                        let Rx::Recving(old) = std::mem::replace(&mut this.rx, Rx::Closed) else {
-                            unreachable!()
-                        };
-                        let read = old.into_inner();
-                        let action = handle_control_record(
-                            read.socket().fd(),
-                            &mut this.shared.kernel_conn.borrow_mut(),
-                        );
-                        match action {
-                            Ok(action) => {
-                                if let Some(e) = this.apply(read, action) {
-                                    return Poll::Ready(Some(Err(e)));
-                                }
-                            }
-                            Err(e) => return Poll::Ready(Some(Err(e))),
+                        if let Some(e) = this.on_control_record() {
+                            return Poll::Ready(Some(Err(e)));
                         }
                     }
                     Some(Err(CompletionError::Other(code))) if code == -libc::EBADMSG => {
@@ -438,24 +497,16 @@ impl<R: BufRingSpec, S> Stream for KtlsReader<R, S> {
                             "kTLS: record failed AEAD verification (EBADMSG)",
                         ));
                     }
-                    // The ring was empty, not the connection. It refills when
-                    // another holder recycles a buffer, which no poll of this
-                    // stream can bring about — so the runtime hands `ENOBUFS`
-                    // up rather than spinning on it, and classifies it
-                    // `ContinueLater`: the op ended, but it is armable again.
-                    // Both directions stay open, which is the whole difference
-                    // from the arm below.
-                    //
-                    // `WouldBlock` is how that reaches the caller: the one
-                    // error here that means "come back", not "give up". The
-                    // coming back is the caller's to do, and it is enough —
-                    // the next poll re-arms, and what the socket was holding
-                    // is still there to collect.
+                    // The ring was empty, not the connection, and waiting for
+                    // a buffer to come back lost each one to the recvs still
+                    // armed on other connections, for seconds at a time. The
+                    // multishot ended on it (`ContinueLater`), so nothing
+                    // else reads the socket until it is re-armed: read into a
+                    // buffer of our own meanwhile, and go on so while those
+                    // come back full. One that comes back short drained the
+                    // socket, and the multishot is re-armed for what follows.
                     Some(Err(e)) if matches!(e.continuation(), Continuation::ContinueLater) => {
-                        return Poll::Ready(Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "buffer ring empty; the recv is armable still",
-                        ))));
+                        this.read_own();
                     }
                     Some(Err(e)) => return this.fail(completion_to_io(e)),
                 },

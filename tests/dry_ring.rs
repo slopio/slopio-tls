@@ -1,19 +1,15 @@
-//! An empty buffer ring is not a dead connection.
+//! An empty buffer ring does not stop a stream.
 //!
 //! The ring is shared by every connection on a worker, and a recv completion
-//! that finds it empty comes back `ENOBUFS`. The runtime classifies that as
-//! `Continuation::ContinueLater`: armable still, but only once another holder
-//! recycles a buffer — which no poll of *this* stream can bring about. So it
-//! is handed up without ending the stream, and the consumer decides when to
-//! come back.
-//!
-//! Treating it as fatal drops healthy connections under ring pressure, and
-//! drops them at random: the one that dies is whichever drew the empty ring,
-//! not the one that emptied it. It used to close the *write* side too, so a
-//! peer mid-response lost that as well, for a reason on the read side.
+//! that finds it empty comes back `ENOBUFS`, which ends the multishot. Waiting
+//! for a buffer to come back lost each one to the recvs still armed on other
+//! connections, for seconds at a time, and a peer holding the ring's buffers
+//! slowed everyone. So the stream reads into buffers of its own instead, until
+//! the socket has nothing more, then re-arms the multishot.
 //!
 //! The ring here holds two buffers and nothing else on the thread uses it, so
-//! holding two frames empties it exactly.
+//! holding two frames empties it exactly; every frame is held, so from then on
+//! every byte has to come through the stream's own buffers.
 
 use std::net::TcpListener;
 use std::sync::Once;
@@ -22,8 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use popple_tls::{
-    Config, ServerName, ServerSettings, StreamState, client_config_dangerous_no_verification,
-    connect, handshake, server_config,
+    Config, Frame, ServerName, ServerSettings, StreamState,
+    client_config_dangerous_no_verification, connect, handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::main_thread_with;
@@ -80,21 +76,22 @@ const RECORD: &[u8] = b"0123456789abcdef";
 #[derive(Debug)]
 struct Outcome {
     bytes: usize,
-    /// The ring ran dry and said so: `WouldBlock` rather than a failure.
-    saw_retry: bool,
-    /// The session state once it had.
+    /// Frames that came in a buffer of the stream's own: the ring ran dry.
+    owned: usize,
+    /// Anything the stream reported as an error.
+    error: Option<String>,
+    /// The session state once everything had arrived.
     state_after: Option<StreamState>,
-    /// Whether the write side still worked once it had.
+    /// Whether the write side still worked then.
     could_still_send: Option<bool>,
-    /// Anything the stream reported as fatal.
-    fatal: Option<String>,
 }
 
-/// Runs the exchange and reports what the server saw. `resume` asks the server
-/// to keep reading after the dry spell, which is the part that depends on the
-/// recv being re-armed.
-fn exchange(resume: bool) -> Outcome {
+/// Runs the exchange and reports what the server saw. The client sends
+/// `RECORDS` records, and as many again after a KeyUpdate if `key_update`.
+fn exchange(key_update: bool) -> Outcome {
     init_provider();
+    let rounds = if key_update { 2 } else { 1 };
+    let expected = rounds * RECORDS * RECORD.len();
     let port = pick_port();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<Outcome>();
@@ -112,42 +109,27 @@ fn exchange(resume: bool) -> Outcome {
 
             let mut outcome = Outcome {
                 bytes: 0,
-                saw_retry: false,
+                owned: 0,
+                error: None,
                 state_after: None,
                 could_still_send: None,
-                fatal: None,
             };
             // Every frame is *held*, which is what takes its buffer out of the
             // ring. Two of them and there is nothing left to receive into.
             let mut held = Vec::new();
 
             let _ = timeout(Duration::from_secs(5), async {
-                while outcome.bytes < RECORDS * RECORD.len() {
+                while outcome.bytes < expected {
                     match stream.next().await {
                         Some(Ok(frame)) => {
                             outcome.bytes += frame.as_ref().len();
+                            if matches!(frame, Frame::Owned(_)) {
+                                outcome.owned += 1;
+                            }
                             held.push(frame);
                         }
-                        Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            outcome.saw_retry = true;
-                            // Asked while the ring is still empty: a dry ring
-                            // must leave the session exactly as it was.
-                            outcome.state_after = Some(stream.state());
-                            outcome.could_still_send =
-                                Some(stream.send(&b"still here"[..]).await.0.is_ok());
-                            // Hand the buffers back and come round again.
-                            // No yield: the buffers are already recycled, so
-                            // the next poll re-arms the recv and picks up what
-                            // the socket still holds. (Yielding here would park
-                            // this root future with an empty task list, which
-                            // nothing wakes.)
-                            held.clear();
-                            if !resume {
-                                break;
-                            }
-                        }
                         Some(Err(e)) => {
-                            outcome.fatal = Some(format!("{e} (kind {:?})", e.kind()));
+                            outcome.error = Some(format!("{e} (kind {:?})", e.kind()));
                             break;
                         }
                         None => break,
@@ -155,6 +137,8 @@ fn exchange(resume: bool) -> Outcome {
                 }
             })
             .await;
+            outcome.state_after = Some(stream.state());
+            outcome.could_still_send = Some(stream.send(&b"still here"[..]).await.0.is_ok());
 
             done_tx.send(outcome).unwrap();
         });
@@ -176,16 +160,20 @@ fn exchange(resume: bool) -> Outcome {
             .expect("client connect")
             .into_messages::<ClientRing>();
 
-            for _ in 0..RECORDS {
-                // Spaced so the kernel does not coalesce several records into
-                // one completion, which would spend fewer buffers than this is
-                // counting on.
-                Sleep::during(Duration::from_millis(30)).await;
-                // A send that fails is not the verdict here: a server that gave
-                // up on the dry ring has already closed the socket, and the
-                // broken pipe would only hide what it reported.
-                if ktls.send(RECORD).await.0.is_err() {
-                    break;
+            for round in 0..rounds {
+                if round > 0 {
+                    ktls.initiate_key_update().await.expect("key update");
+                }
+                for _ in 0..RECORDS {
+                    // Spaced so the kernel does not coalesce several records
+                    // into one completion, which would spend fewer buffers than
+                    // this is counting on.
+                    Sleep::during(Duration::from_millis(30)).await;
+                    // A send that fails is not the verdict here: what the
+                    // server reported is.
+                    if ktls.send(RECORD).await.0.is_err() {
+                        return;
+                    }
                 }
             }
             Sleep::during(Duration::from_millis(300)).await;
@@ -198,51 +186,52 @@ fn exchange(resume: bool) -> Outcome {
     outcome
 }
 
-/// What the stream owes its caller when the ring runs out: an error that says
-/// "come back", and a session left untouched — both directions still open, the
-/// write side still usable.
+/// With every ring buffer held, the stream still reads everything: in
+/// buffers of its own, with the session untouched.
 #[test]
-fn an_empty_ring_is_retryable_not_fatal() {
+fn an_empty_ring_does_not_stop_the_stream() {
     let outcome = exchange(false);
 
     assert_eq!(
-        outcome.fatal, None,
-        "an empty ring must not fail the connection"
+        outcome.error, None,
+        "an empty ring must not fail the stream"
     );
     assert!(
-        outcome.saw_retry,
-        "the ring never ran dry, so this proved nothing: \
-         {} bytes arrived with two buffers held",
+        outcome.owned > 0,
+        "the ring never ran dry, so this proved nothing: {outcome:?}"
+    );
+    assert_eq!(
         outcome.bytes,
+        RECORDS * RECORD.len(),
+        "everything sent arrived, ring or no ring"
     );
     assert_eq!(
         outcome.state_after,
         Some(StreamState::Open),
-        "a dry ring closes neither direction"
+        "both directions open"
     );
     assert_eq!(
         outcome.could_still_send,
         Some(true),
-        "and the write side never had anything to do with it"
+        "and the write side usable"
     );
 }
 
-/// The other half: having got its buffers back, the stream goes on reading the
-/// same connection.
-///
-/// The terminal `ENOBUFS` completion ends the kernel op, and the next poll
-/// re-arms it — nothing queued on the socket is lost in between, which is what
-/// makes "come back later" a real answer rather than a polite way to drop a
-/// connection.
+/// A control record met by a recv of the stream's own is read and applied as
+/// one met by the multishot is: here a KeyUpdate, after which every record is
+/// under the new key and would fail AEAD verification if it had been missed.
 #[test]
-fn the_stream_resumes_once_the_ring_refills() {
+fn a_key_update_outside_the_ring_still_applies() {
     let outcome = exchange(true);
 
-    assert_eq!(outcome.fatal, None, "nothing fatal happened");
-    assert!(outcome.saw_retry, "the ring ran dry");
+    assert_eq!(
+        outcome.error, None,
+        "the KeyUpdate was applied: {outcome:?}"
+    );
+    assert!(outcome.owned > 0, "the ring ran dry: {outcome:?}");
     assert_eq!(
         outcome.bytes,
-        RECORDS * RECORD.len(),
-        "everything sent arrived, across the dry spell"
+        2 * RECORDS * RECORD.len(),
+        "everything sent arrived, before and after the KeyUpdate"
     );
 }
