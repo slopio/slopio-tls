@@ -15,15 +15,15 @@ use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use popple_tls::{
+use slopio_tls::{
     Config, ServerName, ServerSettings, client_config_dangerous_no_verification, connect,
     handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime::runtime::time::{Sleep, timeout};
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::runtime::time::{Sleep, timeout};
+use slopio::streams::StreamExt;
 
 mod common;
 use common::MediumRing;

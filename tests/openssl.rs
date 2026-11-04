@@ -6,12 +6,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use popple_tls::{Config, HandshakeError, ServerSettings, handshake, server_config};
+use slopio_tls::{Config, HandshakeError, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::channels::unbounded_channel;
-use runtime::main_thread_with;
-use runtime::net::{MultiAccept, socket_send};
-use runtime_streams::StreamExt;
+use slopio::channels::unbounded_channel;
+use slopio::main_thread_with;
+use slopio::net::{MultiAccept, socket_send};
+use slopio::streams::StreamExt;
 
 mod common;
 use common::MediumRing;
@@ -515,7 +515,7 @@ fn split_halves_answer_peer_requested_key_update() {
                 .expect("handshake");
             let (mut reader, mut writer) = ktls.into_messages::<MediumRing>().split();
             let (frames_tx, frames_rx) = unbounded_channel::<Vec<u8>>();
-            runtime::spawn(async move {
+            slopio::spawn(async move {
                 while let Some(Ok(frame)) = reader.next().await {
                     frames_tx.send(frame.as_ref().to_vec());
                 }

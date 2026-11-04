@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use runtime::net::{IoBuf, SocketWrapper, send_all as runtime_send_all, socket_peek, socket_recv};
-use runtime::runtime::time::timeout;
+use slopio::net::{IoBuf, SocketWrapper, send_all as runtime_send_all, socket_peek, socket_recv};
+use slopio::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::kernel::KernelConnection;
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};

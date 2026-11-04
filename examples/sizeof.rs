@@ -2,12 +2,12 @@ use std::future::Future;
 use std::os::fd::FromRawFd;
 use std::time::Duration;
 
-use popple_tls::{ServerSettings, handshake, server_config};
+use slopio_tls::{ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::net::SocketWrapper;
+use slopio::net::SocketWrapper;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 fn fsize<F: Future>(_: F) -> usize {
     std::mem::size_of::<F>()
@@ -42,15 +42,15 @@ fn main() {
         std::mem::size_of::<std::sync::Arc<rustls::ServerConfig>>()
     );
     println!(
-        "popple_tls::Config:         {} B",
-        std::mem::size_of::<popple_tls::Config>()
+        "slopio_tls::Config:         {} B",
+        std::mem::size_of::<slopio_tls::Config>()
     );
     println!(
-        "popple_tls::KtlsSocket:     {} B",
-        std::mem::size_of::<popple_tls::KtlsSocket>()
+        "slopio_tls::KtlsSocket:     {} B",
+        std::mem::size_of::<slopio_tls::KtlsSocket>()
     );
     println!(
-        "popple_tls::KtlsMessages:   {} B",
-        std::mem::size_of::<popple_tls::KtlsMessages<MediumRing>>()
+        "slopio_tls::KtlsMessages:   {} B",
+        std::mem::size_of::<slopio_tls::KtlsMessages<MediumRing>>()
     );
 }

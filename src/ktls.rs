@@ -1,4 +1,4 @@
-use runtime::net::{OwnedReadHalf, OwnedWriteHalf, SocketWrapper};
+use slopio::net::{OwnedReadHalf, OwnedWriteHalf, SocketWrapper};
 use rustls::kernel::KernelConnection;
 use rustls::server::ServerConnectionData;
 use rustls::{ConnectionTrafficSecrets, ExtractedSecrets};

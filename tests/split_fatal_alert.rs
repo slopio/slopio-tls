@@ -7,16 +7,16 @@ use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use popple_tls::{
+use slopio_tls::{
     Config, ServerName, ServerSettings, client_config_dangerous_no_verification, connect,
     handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::channels::unbounded_channel;
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime::runtime::time::timeout;
-use runtime_streams::StreamExt;
+use slopio::channels::unbounded_channel;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::runtime::time::timeout;
+use slopio::streams::StreamExt;
 
 mod common;
 use common::MediumRing;
@@ -96,7 +96,7 @@ fn fatal_alert_fails_the_writers_inflight_send() {
             let (mut reader, mut writer) = ktls.into_messages::<MediumRing>().split();
 
             let (seen_tx, seen_rx) = unbounded_channel::<std::io::Result<()>>();
-            runtime::spawn(async move {
+            slopio::spawn(async move {
                 let outcome = match reader.next().await {
                     Some(Err(e)) => Err(e),
                     _ => Ok(()),

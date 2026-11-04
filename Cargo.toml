@@ -1,11 +1,16 @@
 [package]
-name = "popple-tls"
+name = "slopio-tls"
 version = "0.1.0"
 edition = "2024"
+description = "TLS 1.3 for the slopio runtime, with the record layer in the kernel (kTLS)"
+keywords = ["tls", "ktls", "rustls", "io-uring", "slopio"]
+categories = ["network-programming", "cryptography", "os::linux-apis"]
+license = "MIT"
+repository = "https://github.com/slopio/slopio-tls"
+readme = "README.md"
 
 [dependencies]
-runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
-runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+slopio = "0.1"
 libc = "0.2"
 rustls = "0.23.36"
 zeroize = "1"

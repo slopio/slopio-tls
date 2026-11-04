@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use popple_tls::{ServerSettings, handshake, ktls_available, server_config};
+use slopio_tls::{ServerSettings, handshake, ktls_available, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::streams::StreamExt;
 
-runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn main() {

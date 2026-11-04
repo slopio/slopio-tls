@@ -17,24 +17,24 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use popple_tls::{
+use slopio_tls::{
     Config, Frame, ServerName, ServerSettings, StreamState,
     client_config_dangerous_no_verification, connect, handshake, server_config,
 };
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime::runtime::time::{Sleep, timeout};
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::runtime::time::{Sleep, timeout};
+use slopio::streams::StreamExt;
 
 mod common;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 // Two buffers, no reserve: the smallest ring that can run dry on purpose.
-runtime::define_buf_ring!(DryRing, bgid = 2, buffer_size = 4096, ring_size = 2);
+slopio::define_buf_ring!(DryRing, bgid = 2, buffer_size = 4096, ring_size = 2);
 
 // The client's ring is its own business; it only has to be able to send.
-runtime::define_buf_ring!(ClientRing, bgid = 3, buffer_size = 16384, ring_size = 64);
+slopio::define_buf_ring!(ClientRing, bgid = 3, buffer_size = 16384, ring_size = 64);
 
 static INIT: Once = Once::new();
 

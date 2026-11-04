@@ -3,12 +3,12 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=POPPLE_POOL_MAX_LEN");
+    println!("cargo:rerun-if-env-changed=SLOPIO_TLS_POOL_MAX_LEN");
 
-    let pool_max_len: usize = match env::var("POPPLE_POOL_MAX_LEN") {
+    let pool_max_len: usize = match env::var("SLOPIO_TLS_POOL_MAX_LEN") {
         Ok(v) => v
             .parse()
-            .expect("POPPLE_POOL_MAX_LEN must be a non-negative integer"),
+            .expect("SLOPIO_TLS_POOL_MAX_LEN must be a non-negative integer"),
         Err(_) => 32,
     };
 

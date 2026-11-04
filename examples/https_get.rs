@@ -1,11 +1,11 @@
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-use popple_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
-use runtime::main_thread_with;
-use runtime_streams::StreamExt;
+use slopio_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
+use slopio::main_thread_with;
+use slopio::streams::StreamExt;
 
-runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 fn main() {
     if !ktls_available() {
@@ -49,7 +49,7 @@ fn main() {
         );
 
         let req = format!(
-            "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: popple-tls/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+            "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: slopio-tls/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n"
         );
 
         let mut stream = ktls.into_messages::<MediumRing>();

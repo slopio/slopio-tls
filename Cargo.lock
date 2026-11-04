@@ -3,11 +3,6 @@
 version = 4
 
 [[package]]
-name = "async_timers"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -154,15 +149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io_uring_rb"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
-dependencies = [
- "io-uring",
- "rustix",
-]
-
-[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -199,15 +185,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "mimalloc"
-version = "0.1.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
-dependencies = [
- "libmimalloc-sys",
-]
 
 [[package]]
 name = "num-conv"
@@ -256,18 +233,6 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
-
-[[package]]
-name = "popple-tls"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rcgen",
- "runtime",
- "runtime-streams",
- "rustls",
- "zeroize",
-]
 
 [[package]]
 name = "powerfmt"
@@ -367,40 +332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
-dependencies = [
- "libc",
- "mimalloc",
- "runtime-core",
-]
-
-[[package]]
-name = "runtime-core"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
-dependencies = [
- "async_timers",
- "bitfield-struct",
- "bumpalo",
- "io-uring",
- "io_uring_rb",
- "libc",
- "pin-project",
- "rand",
- "runtime-streams",
- "slab",
- "smallvec",
- "socket2",
-]
-
-[[package]]
-name = "runtime-streams"
-version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#d8b636f0082bac93b97b6d5d0038abc93f69946b"
-
-[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,6 +411,36 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slopio"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11e7b942e83aa37165cb6d076a0c0992a674bb0164fadf03865c8598f30d415c"
+dependencies = [
+ "bitfield-struct",
+ "bumpalo",
+ "io-uring",
+ "libc",
+ "libmimalloc-sys",
+ "pin-project",
+ "rand",
+ "rustix",
+ "slab",
+ "smallvec",
+ "socket2",
+]
+
+[[package]]
+name = "slopio-tls"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rcgen",
+ "rustls",
+ "slopio",
+ "zeroize",
+]
 
 [[package]]
 name = "smallvec"

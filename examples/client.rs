@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use popple_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
-use runtime::main_thread_with;
-use runtime_streams::StreamExt;
+use slopio_tls::{ServerName, client_config_dangerous_no_verification, connect, ktls_available};
+use slopio::main_thread_with;
+use slopio::streams::StreamExt;
 
-runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 fn main() {
     if !ktls_available() {
@@ -41,7 +41,7 @@ fn main() {
 
         let mut stream = ktls.into_messages::<MediumRing>();
         stream
-            .send(b"hello from popple client\n")
+            .send(b"hello from slopio-tls client\n")
             .await
             .0
             .expect("send");

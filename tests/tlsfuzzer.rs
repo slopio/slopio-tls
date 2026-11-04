@@ -25,11 +25,11 @@ use std::sync::{Arc, Once, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use popple_tls::{Config, ServerSettings, handshake, server_config};
+use slopio_tls::{Config, ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::streams::StreamExt;
 
 mod common;
 use common::MediumRing;
@@ -105,7 +105,7 @@ impl EchoServer {
                         break;
                     }
                     let cfg = cfg.clone();
-                    runtime::spawn(async move {
+                    slopio::spawn(async move {
                         let Ok(ktls) = handshake(socket, cfg, Duration::from_secs(5)).await else {
                             return;
                         };

@@ -1,4 +1,4 @@
-# popple-tls
+# slopio-tls
 
 TLS 1.3 for the [slopio](https://github.com/slopio/slopio) runtime, with the record layer in the kernel. rustls runs the handshake, then the session keys are handed to kTLS and every record after that is encrypted and decrypted by Linux. Server and client.
 
@@ -15,7 +15,7 @@ What that implies:
 
 ## Status
 
-Experimental. Not on crates.io, and the API follows slopio's, which changes without notice.
+Experimental. The API follows slopio's and will change between 0.x releases.
 
 ## Requirements
 
@@ -28,9 +28,8 @@ Experimental. Not on crates.io, and the API follows slopio's, which changes with
 
 ```toml
 [dependencies]
-popple-tls = { git = "ssh://git@github.com/slopio/slopio-tls.git" }
-runtime = { git = "ssh://git@github.com/slopio/slopio.git" }
-runtime-streams = { git = "ssh://git@github.com/slopio/slopio.git" }
+slopio-tls = "0.1"
+slopio = "0.1"
 rustls = "0.23"
 ```
 
@@ -39,12 +38,12 @@ An echo server:
 ```rust
 use std::time::Duration;
 
-use popple_tls::{ServerSettings, handshake, server_config};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::streams::StreamExt;
+use slopio_tls::{ServerSettings, handshake, server_config};
 
-runtime::define_buf_ring!(Ring, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(Ring, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 fn main() {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -83,11 +82,11 @@ A client calls `connect(addr, server_name, client_config(..)?, deadline)` and ge
 
 ## Configuration
 
-`POPPLE_POOL_MAX_LEN` caps the per-thread pool of handshake buffers (default 32). It is read at build time, so set it in your application's `.cargo/config.toml`:
+`SLOPIO_TLS_POOL_MAX_LEN` caps the per-thread pool of handshake buffers (default 32). It is read at build time, so set it in your application's `.cargo/config.toml`:
 
 ```toml
 [env]
-POPPLE_POOL_MAX_LEN = "64"
+SLOPIO_TLS_POOL_MAX_LEN = "64"
 ```
 
 ## Examples

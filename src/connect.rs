@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use runtime::net::{SocketWrapper, connect_tcp};
-use runtime::runtime::time::timeout;
+use slopio::net::{SocketWrapper, connect_tcp};
+use slopio::runtime::time::timeout;
 use rustls::ExtractedSecrets;
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
 use rustls::kernel::KernelConnection;

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use popple_tls::{ServerSettings, handshake, server_config};
+use slopio_tls::{ServerSettings, handshake, server_config};
 use rcgen::{CertificateParams, KeyPair};
-use runtime::main_thread_with;
-use runtime::net::MultiAccept;
-use runtime_streams::StreamExt;
+use slopio::main_thread_with;
+use slopio::net::MultiAccept;
+use slopio::streams::StreamExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-runtime::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
+slopio::define_buf_ring!(MediumRing, bgid = 1, buffer_size = 16384, ring_size = 2048);
 
 const RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nhello via h1\n\n";
